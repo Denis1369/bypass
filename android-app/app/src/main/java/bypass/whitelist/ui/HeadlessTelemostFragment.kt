@@ -1,0 +1,71 @@
+package bypass.whitelist.ui
+
+import android.os.Bundle
+import android.util.Log
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import bypass.whitelist.R
+import bypass.whitelist.tunnel.HeadlessRelayController
+import bypass.whitelist.tunnel.VpnStatus
+import bypass.whitelist.util.Prefs
+import org.json.JSONObject
+
+class HeadlessTelemostFragment : Fragment() {
+
+    private lateinit var relay: HeadlessRelayController
+
+    private val host: JoinFragmentHost?
+        get() = activity as? JoinFragmentHost
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?,
+    ): View = inflater.inflate(R.layout.fragment_headless_telemost, container, false)
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        val joinLink = requireArguments().getString(ARG_URL, "")
+        val displayName = Prefs.autoclickName
+
+        relay = HeadlessRelayController(
+            requireContext().applicationInfo.nativeLibraryDir,
+            relayMode = "telemost-headless-joiner",
+            onLog = { host?.appendLog(it) },
+            onStatus = { status ->
+                Log.d("TM-HEADLESS", "status: $status")
+                host?.onJoinStatus(status)
+                when (status) {
+                    VpnStatus.STARTING -> {
+                        val params = JSONObject().apply {
+                            put("joinLink", joinLink)
+                            put("displayName", displayName)
+                        }
+                        relay.sendJoinParams(params.toString())
+                    }
+                    VpnStatus.TUNNEL_ACTIVE -> activity?.runOnUiThread { host?.requestVpn() }
+                    else -> {}
+                }
+            },
+        )
+        relay.start()
+    }
+
+    override fun onDestroyView() {
+        if (::relay.isInitialized) relay.stop()
+        super.onDestroyView()
+    }
+
+    companion object {
+        const val ARG_URL = "url"
+
+        fun newInstance(url: String): HeadlessTelemostFragment {
+            return HeadlessTelemostFragment().apply {
+                arguments = Bundle().apply {
+                    putString(ARG_URL, url)
+                }
+            }
+        }
+    }
+}

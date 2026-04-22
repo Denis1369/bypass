@@ -1,0 +1,23 @@
+services:
+  telemost-guest:
+    image: whitelist-bypass-telemost-vps:latest
+    build:
+      context: ..
+      dockerfile: docker-vps/Dockerfile
+    restart: unless-stopped
+    command:
+      - --join-link
+      - ${TELEMOST_JOIN_LINK}
+      - --display-name
+      - ${TELEMOST_DISPLAY_NAME:-Server}
+      - --resources
+      - ${TELEMOST_RESOURCES:-moderate}
+    volumes:
+      - ./data:/work
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
