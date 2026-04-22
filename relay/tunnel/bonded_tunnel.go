@@ -173,6 +173,7 @@ type bondedHistoryEntry struct {
 	frame           []byte
 	sentAt          time.Time
 	retransmits     uint32
+	retries         int
 	chunkLanes      []int
 	chunkFrameSize  []int
 	chunkAppLimited []bool
@@ -369,6 +370,8 @@ func NewBondedTunnel(lanes []DataTunnel, logFn func(string, ...any)) *BondedTunn
 		})
 		t.wg.Add(1)
 		go t.pacerLoop(laneIndex)
+		t.wg.Add(1)
+		go t.controlLoop(laneIndex)
 	}
 	t.wg.Add(1)
 	go t.gapLoop()
@@ -1165,7 +1168,7 @@ func (t *BondedTunnel) rtoLoop() {
 				continue
 			}
 			t.releaseHistoryInflightLocked(entry)
-			if entry.retransmits >= bondedMaxRetransmits || now.Sub(entry.sentAt) > bondedHistoryTTL {
+			if entry.retries >= 5 || now.Sub(entry.sentAt) > bondedHistoryTTL {
 				t.penalizeHistoryLocked(entry, 0.20)
 				t.markHistorySkippedLocked(entry)
 				delete(t.history, entry.frameID)
@@ -1174,6 +1177,7 @@ func (t *BondedTunnel) rtoLoop() {
 			}
 			t.penalizeHistoryLocked(entry, 0.08)
 			entry.retransmits++
+			entry.retries++
 			entry.sentAt = now
 			ops = append(ops, t.planFrameSendLocked(entry, true)...)
 		}
@@ -2024,7 +2028,11 @@ func (t *BondedTunnel) sendOps(ops []bondedSend) {
 				return
 			}
 			state := &t.laneStates[op.lane]
-			if state.inflightBytes+len(op.frame) <= state.cwndBytes {
+			cwndLimit := state.cwndBytes
+			if op.retransmit {
+				cwndLimit += 10 * bondedMaxChunkSize
+			}
+			if state.inflightBytes+len(op.frame) <= cwndLimit {
 				state.inflightBytes += len(op.frame)
 				state.metrics.txBytes.Add(uint64(len(op.frame)))
 				if op.retransmit {
@@ -2048,7 +2056,7 @@ func (t *BondedTunnel) sendOps(ops []bondedSend) {
 
 func (t *BondedTunnel) pacerLoop(lane int) {
 	defer t.wg.Done()
-	if lane < 0 || lane >= len(t.laneQueues) || lane >= len(t.controlQueues) {
+	if lane < 0 || lane >= len(t.laneQueues) {
 		return
 	}
 	batch := bondedBatchState{}
@@ -2173,7 +2181,7 @@ func (t *BondedTunnel) pacerLoop(lane int) {
 				return
 			}
 			continue
-		case op = <-t.controlQueues[lane]:
+		case op = <-t.laneQueues[lane]:
 		default:
 			select {
 			case <-t.ctx.Done():
@@ -2185,12 +2193,93 @@ func (t *BondedTunnel) pacerLoop(lane int) {
 					return
 				}
 				continue
-			case op = <-t.controlQueues[lane]:
 			case op = <-t.laneQueues[lane]:
 			}
 		}
 		if !enqueueToBatch(op) {
 			return
+		}
+	}
+}
+
+func (t *BondedTunnel) controlLoop(lane int) {
+	defer t.wg.Done()
+	if lane < 0 || lane >= len(t.controlQueues) {
+		return
+	}
+	buf := make([]byte, 0, bondedChunkPayloadSize)
+	flushTimer := time.NewTimer(time.Hour)
+	if !flushTimer.Stop() {
+		select {
+		case <-flushTimer.C:
+		default:
+		}
+	}
+	var flushCh <-chan time.Time
+
+	flush := func() bool {
+		if len(buf) == 0 {
+			return true
+		}
+		payload := make([]byte, len(buf))
+		copy(payload, buf)
+		t.lanes[lane].SendData(payload)
+		buf = buf[:0]
+		if !flushTimer.Stop() {
+			select {
+			case <-flushTimer.C:
+			default:
+			}
+		}
+		flushCh = nil
+		return !t.closed.Load()
+	}
+
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		case <-t.closeCh:
+			return
+		case <-flushCh:
+			if !flush() {
+				return
+			}
+		case op := <-t.controlQueues[lane]:
+			if len(op.frame) == 0 {
+				continue
+			}
+			if len(op.frame) > bondedChunkPayloadSize {
+				if !flush() {
+					return
+				}
+				t.lanes[lane].SendData(op.frame)
+				if t.closed.Load() {
+					return
+				}
+				continue
+			}
+			if len(buf) > 0 && len(buf)+len(op.frame) > bondedChunkPayloadSize {
+				if !flush() {
+					return
+				}
+			}
+			if len(buf) == 0 {
+				if !flushTimer.Stop() {
+					select {
+					case <-flushTimer.C:
+					default:
+					}
+				}
+				flushTimer.Reset(bondedFlushInterval)
+				flushCh = flushTimer.C
+			}
+			buf = append(buf, op.frame...)
+			if len(buf) >= bondedChunkPayloadSize {
+				if !flush() {
+					return
+				}
+			}
 		}
 	}
 }
@@ -2334,7 +2423,7 @@ func (t *BondedTunnel) pruneHistoryLocked(now time.Time) {
 }
 
 func (t *BondedTunnel) historyRTOForEntryLocked(entry *bondedHistoryEntry) time.Duration {
-	rto := time.Second
+	base := time.Second
 	for _, lane := range uniqueLanes(entry.chunkLanes) {
 		if lane < 0 || lane >= len(t.laneStates) {
 			continue
@@ -2348,12 +2437,19 @@ func (t *BondedTunnel) historyRTOForEntryLocked(entry *bondedHistoryEntry) time.
 			continue
 		}
 		candidate := 4 * rtt
-		if candidate > rto {
-			rto = candidate
+		if candidate > base {
+			base = candidate
 		}
 	}
-	if rto < time.Second {
-		rto = time.Second
+	if base < time.Second {
+		base = time.Second
+	}
+	rto := base
+	for i := 0; i < entry.retries; i++ {
+		rto *= 2
+		if rto > bondedHistoryTTL {
+			return bondedHistoryTTL
+		}
 	}
 	return rto
 }
