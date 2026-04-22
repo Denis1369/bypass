@@ -32,6 +32,7 @@ const (
 	bondedMinSpacing         = 200 * time.Microsecond
 	bondedControlMinSpacing  = time.Millisecond
 	bondedFlushInterval      = 12 * time.Millisecond
+	bondedMaxBurstBytes      = 3000
 
 	bondedNackRetryInterval = 120 * time.Millisecond
 	bondedHardTimeout       = 1500 * time.Millisecond
@@ -446,10 +447,25 @@ func (t *BondedTunnel) LaneHealthSnapshots() []LaneHealthSnapshot {
 }
 
 func (t *BondedTunnel) ResetLane(index int) {
+	now := time.Now()
 	t.sendMu.Lock()
-	defer t.sendMu.Unlock()
-	t.resetLaneLocked(index, time.Now())
+	rescue := t.collectLaneRescueEntriesLocked(index)
+	for _, entry := range rescue {
+		t.releaseHistoryInflightLocked(entry)
+		entry.sentAt = now
+		entry.retransmits++
+	}
+	t.drainLaneQueuesLocked(index)
+	t.resetLaneLocked(index, now)
+	ops := make([]bondedSend, 0, len(rescue))
+	for _, entry := range rescue {
+		ops = append(ops, t.planFrameSendLocked(entry, true)...)
+	}
 	t.sendCond.Broadcast()
+	t.sendMu.Unlock()
+	if len(ops) > 0 {
+		go t.sendOps(ops)
+	}
 }
 
 func (t *BondedTunnel) handleLaneData(lane int, data []byte) {
@@ -2088,6 +2104,14 @@ func (t *BondedTunnel) pacerLoop(lane int) {
 		return true
 	}
 
+	sendControlImmediate := func(op bondedSend) bool {
+		if len(op.frame) == 0 {
+			return true
+		}
+		t.lanes[lane].SendData(op.frame)
+		return !t.closed.Load()
+	}
+
 	for {
 		var op bondedSend
 		select {
@@ -2101,6 +2125,10 @@ func (t *BondedTunnel) pacerLoop(lane int) {
 			}
 			continue
 		case op = <-t.controlQueues[lane]:
+			if !sendControlImmediate(op) {
+				return
+			}
+			continue
 		default:
 			select {
 			case <-t.ctx.Done():
@@ -2113,6 +2141,10 @@ func (t *BondedTunnel) pacerLoop(lane int) {
 				}
 				continue
 			case op = <-t.controlQueues[lane]:
+				if !sendControlImmediate(op) {
+					return
+				}
+				continue
 			case op = <-t.laneQueues[lane]:
 			}
 		}
@@ -2122,7 +2154,7 @@ func (t *BondedTunnel) pacerLoop(lane int) {
 	}
 }
 
-func (t *BondedTunnel) waitForPacing(lane int, frameSize int, control bool) {
+func (t *BondedTunnel) waitForPacing(lane int, frameSize int, _ bool) {
 	for {
 		if t.closed.Load() {
 			return
@@ -2144,7 +2176,7 @@ func (t *BondedTunnel) waitForPacing(lane int, frameSize int, control bool) {
 		}
 		if elapsed := now.Sub(state.lastPacingUpdate); elapsed > 0 {
 			state.pacingBudget += elapsed.Seconds() * state.pacingRate
-			bucketCap := float64(maxInt(frameSize*2, bondedChunkPayloadSize*2))
+			bucketCap := float64(bondedMaxBurstBytes)
 			if state.pacingBudget > bucketCap {
 				state.pacingBudget = bucketCap
 			}
@@ -2155,9 +2187,6 @@ func (t *BondedTunnel) waitForPacing(lane int, frameSize int, control bool) {
 		}
 		sendAt := state.nextSendAt
 		minSpacing := bondedMinSpacing
-		if control {
-			minSpacing = bondedControlMinSpacing
-		}
 		deficit := float64(frameSize) - state.pacingBudget
 		if deficit <= 0 && !sendAt.After(now) {
 			state.pacingBudget -= float64(frameSize)
@@ -2260,6 +2289,49 @@ func (t *BondedTunnel) pruneHistoryLocked(now time.Time) {
 		t.releaseHistoryInflightLocked(entry)
 		delete(t.history, frameID)
 		t.historyOrder = t.historyOrder[1:]
+	}
+}
+
+func (t *BondedTunnel) collectLaneRescueEntriesLocked(index int) []*bondedHistoryEntry {
+	if index < 0 || index >= len(t.laneStates) {
+		return nil
+	}
+	seen := make(map[uint64]struct{})
+	entries := make([]*bondedHistoryEntry, 0, 16)
+	for _, entry := range t.history {
+		for _, lane := range entry.chunkLanes {
+			if lane != index {
+				continue
+			}
+			if _, ok := seen[entry.frameID]; ok {
+				break
+			}
+			seen[entry.frameID] = struct{}{}
+			entries = append(entries, entry)
+			break
+		}
+	}
+	return entries
+}
+
+func (t *BondedTunnel) drainLaneQueuesLocked(index int) {
+	if index < 0 || index >= len(t.laneQueues) || index >= len(t.controlQueues) {
+		return
+	}
+	for {
+		select {
+		case <-t.laneQueues[index]:
+		default:
+			goto drainControl
+		}
+	}
+drainControl:
+	for {
+		select {
+		case <-t.controlQueues[index]:
+		default:
+			return
+		}
 	}
 }
 

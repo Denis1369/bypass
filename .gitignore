@@ -7,3 +7,4 @@ relay/relay
 whitelist-experiments/
 docker-vps/.env
 docker-vps/data/
+com.txt
