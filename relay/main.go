@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"os"
 
-	"whitelist-bypass/relay/common"
 	"whitelist-bypass/relay/androidbind"
+	"whitelist-bypass/relay/common"
 	"whitelist-bypass/relay/pion"
 	"whitelist-bypass/relay/pion/android"
 	"whitelist-bypass/relay/tunnel"
@@ -26,7 +26,7 @@ func main() {
 	socksPort := flag.Int("socks-port", 1080, "SOCKS5 proxy port (joiner mode only)")
 	socksUser := flag.String("socks-user", "", "SOCKS5 proxy username")
 	socksPass := flag.String("socks-pass", "", "SOCKS5 proxy password")
-	bondLanes := flag.Int("bond-lanes", 3, "Number of parallel bonded tunnel lanes for video modes")
+	bondLanes := flag.Int("bond-lanes", 20, "Number of parallel bonded tunnel lanes for video modes")
 	flag.String("local-ip", "", "local IP address (unused, passed via hook)")
 	flag.Parse()
 

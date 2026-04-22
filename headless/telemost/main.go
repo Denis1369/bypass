@@ -690,7 +690,7 @@ func main() {
 	joinLink := flag.String("join-link", "", "existing Telemost conference link to join as guest")
 	displayName := flag.String("display-name", "Headless", "display name for Telemost guest mode")
 	resources := flag.String("resources", "default", "resource mode: default, moderate, unlimited")
-	bondLanes := flag.Int("bond-lanes", 3, "number of parallel bonded tunnel lanes")
+	bondLanes := flag.Int("bond-lanes", 20, "number of parallel bonded tunnel lanes")
 	writeFile := flag.String("write-file", "", "path to file where active call link is appended")
 	flag.Parse()
 	pion.SetTunnelLaneCount(*bondLanes)

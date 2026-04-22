@@ -50,15 +50,15 @@ var iceLogFn func(string, ...any)
 var tunnelLaneCount atomic.Int32
 
 func init() {
-	tunnelLaneCount.Store(3)
+	tunnelLaneCount.Store(20)
 }
 
 func SetTunnelLaneCount(n int) {
 	if n < 1 {
 		n = 1
 	}
-	if n > 8 {
-		n = 8
+	if n > 20 {
+		n = 20
 	}
 	tunnelLaneCount.Store(int32(n))
 }

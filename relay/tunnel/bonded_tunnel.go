@@ -17,9 +17,9 @@ const (
 	bondedMinChunkSize       = 512
 	bondedInitialChunkSize   = bondedMaxDataPayloadSize
 	bondedMaxChunkSize       = bondedMaxDataPayloadSize
-	bondedMinCwndBytes       = 8 * 1024
-	bondedInitialCwndBytes   = 64 * 1024
-	bondedMaxCwndBytes       = 512 * 1024
+	bondedMinCwndBytes       = 128 * 1024
+	bondedInitialCwndBytes   = 256 * 1024
+	bondedMaxCwndBytes       = 8 * 1024 * 1024
 	bondedPriorityFrameSize  = 1200
 	bondedInitialBwBytes     = 512 * 1024
 	bondedMinBwBytes         = 64 * 1024
@@ -31,7 +31,7 @@ const (
 	bondedControlQueueSize   = 256
 	bondedMinSpacing         = 200 * time.Microsecond
 	bondedControlMinSpacing  = time.Millisecond
-	bondedFlushInterval      = 12 * time.Millisecond
+	bondedFlushInterval      = 3 * time.Millisecond
 	bondedMaxBurstBytes      = 3000
 
 	bondedNackRetryInterval = 120 * time.Millisecond
@@ -242,6 +242,11 @@ type bondedBatchState struct {
 	hasData         bool
 }
 
+type bondedLaneCoalescer struct {
+	mu    sync.Mutex
+	batch bondedBatchState
+}
+
 type bondedLaneSnapshot struct {
 	rttMs       int64
 	weight      float64
@@ -292,6 +297,7 @@ type BondedTunnel struct {
 	laneStates    []bondedLaneState
 	laneQueues    []chan bondedSend
 	controlQueues []chan bondedSend
+	coalescers    []bondedLaneCoalescer
 	nextPingID    atomic.Uint64
 	pings         map[uint64]bondedPingState
 
@@ -327,6 +333,7 @@ func NewBondedTunnel(lanes []DataTunnel, logFn func(string, ...any)) *BondedTunn
 		laneStates:       make([]bondedLaneState, len(lanes)),
 		laneQueues:       make([]chan bondedSend, len(lanes)),
 		controlQueues:    make([]chan bondedSend, len(lanes)),
+		coalescers:       make([]bondedLaneCoalescer, len(lanes)),
 		pings:            make(map[uint64]bondedPingState),
 		transportPending: make(map[uint64]*bondedPendingFrame),
 		transportGaps:    make(map[uint64]*bondedGapState),
@@ -372,6 +379,8 @@ func NewBondedTunnel(lanes []DataTunnel, logFn func(string, ...any)) *BondedTunn
 		go t.pacerLoop(laneIndex)
 		t.wg.Add(1)
 		go t.controlLoop(laneIndex)
+		t.wg.Add(1)
+		go t.coalescerFlushLoop(laneIndex)
 	}
 	t.wg.Add(1)
 	go t.gapLoop()
@@ -2059,116 +2068,6 @@ func (t *BondedTunnel) pacerLoop(lane int) {
 	if lane < 0 || lane >= len(t.laneQueues) {
 		return
 	}
-	batch := bondedBatchState{}
-	flushTimer := time.NewTimer(time.Hour)
-	if !flushTimer.Stop() {
-		select {
-		case <-flushTimer.C:
-		default:
-		}
-	}
-	var flushCh <-chan time.Time
-
-	flushBatch := func() bool {
-		if len(batch.buf) == 0 {
-			return true
-		}
-		controlOnly := !batch.hasData
-		payload := make([]byte, len(batch.buf))
-		copy(payload, batch.buf)
-		t.waitForPacing(lane, len(payload), controlOnly)
-		if t.closed.Load() {
-			return false
-		}
-		if batch.hasData {
-			t.sendMu.Lock()
-			if lane >= 0 && lane < len(t.laneStates) {
-				state := &t.laneStates[lane]
-				now := time.Now()
-				state.lastSentFrameID = batch.lastDataFrameID
-				state.lastDataSentAt = now
-				state.appLimited = false
-				if !state.roundPending {
-					state.roundPending = true
-					state.roundAppLimited = true
-				}
-				state.nextRoundDelivered = batch.lastDataFrameID
-				state.roundSentFrames += batch.dataFrames
-				state.roundAppLimited = state.roundAppLimited && batch.allAppLimited
-			}
-			t.sendMu.Unlock()
-		}
-		t.lanes[lane].SendData(payload)
-		batch = bondedBatchState{}
-		if !flushTimer.Stop() {
-			select {
-			case <-flushTimer.C:
-			default:
-			}
-		}
-		flushCh = nil
-		return true
-	}
-
-	enqueueToBatch := func(op bondedSend) bool {
-		if len(op.frame) > bondedChunkPayloadSize {
-			if !flushBatch() {
-				return false
-			}
-			t.waitForPacing(lane, len(op.frame), op.frameID == 0)
-			if t.closed.Load() {
-				return false
-			}
-			if op.frameID != 0 {
-				t.sendMu.Lock()
-				if lane >= 0 && lane < len(t.laneStates) {
-					state := &t.laneStates[lane]
-					now := time.Now()
-					state.lastSentFrameID = op.frameID
-					state.lastDataSentAt = now
-					state.appLimited = false
-					if !state.roundPending {
-						state.roundPending = true
-						state.roundAppLimited = true
-					}
-					state.nextRoundDelivered = op.frameID
-					state.roundSentFrames++
-					state.roundAppLimited = state.roundAppLimited && op.appLimited
-				}
-				t.sendMu.Unlock()
-			}
-			t.lanes[lane].SendData(op.frame)
-			return true
-		}
-		if len(batch.buf) > 0 && len(batch.buf)+len(op.frame) > bondedChunkPayloadSize {
-			if !flushBatch() {
-				return false
-			}
-		}
-		if len(batch.buf) == 0 {
-			batch.allAppLimited = true
-			if !flushTimer.Stop() {
-				select {
-				case <-flushTimer.C:
-				default:
-				}
-			}
-			flushTimer.Reset(bondedFlushInterval)
-			flushCh = flushTimer.C
-		}
-		batch.buf = append(batch.buf, op.frame...)
-		if op.frameID != 0 {
-			batch.hasData = true
-			batch.lastDataFrameID = op.frameID
-			batch.dataFrames++
-			batch.allAppLimited = batch.allAppLimited && op.appLimited
-		}
-		if len(batch.buf) >= bondedChunkPayloadSize {
-			return flushBatch()
-		}
-		return true
-	}
-
 	for {
 		var op bondedSend
 		select {
@@ -2176,11 +2075,6 @@ func (t *BondedTunnel) pacerLoop(lane int) {
 			return
 		case <-t.closeCh:
 			return
-		case <-flushCh:
-			if !flushBatch() {
-				return
-			}
-			continue
 		case op = <-t.laneQueues[lane]:
 		default:
 			select {
@@ -2188,15 +2082,14 @@ func (t *BondedTunnel) pacerLoop(lane int) {
 				return
 			case <-t.closeCh:
 				return
-			case <-flushCh:
-				if !flushBatch() {
-					return
-				}
-				continue
 			case op = <-t.laneQueues[lane]:
 			}
 		}
-		if !enqueueToBatch(op) {
+		t.waitForPacing(lane, len(op.frame), false)
+		if t.closed.Load() {
+			return
+		}
+		if !t.appendLaneCoalescer(lane, op) {
 			return
 		}
 	}
@@ -2207,78 +2100,127 @@ func (t *BondedTunnel) controlLoop(lane int) {
 	if lane < 0 || lane >= len(t.controlQueues) {
 		return
 	}
-	buf := make([]byte, 0, bondedChunkPayloadSize)
-	flushTimer := time.NewTimer(time.Hour)
-	if !flushTimer.Stop() {
-		select {
-		case <-flushTimer.C:
-		default:
-		}
-	}
-	var flushCh <-chan time.Time
-
-	flush := func() bool {
-		if len(buf) == 0 {
-			return true
-		}
-		payload := make([]byte, len(buf))
-		copy(payload, buf)
-		t.lanes[lane].SendData(payload)
-		buf = buf[:0]
-		if !flushTimer.Stop() {
-			select {
-			case <-flushTimer.C:
-			default:
-			}
-		}
-		flushCh = nil
-		return !t.closed.Load()
-	}
-
 	for {
 		select {
 		case <-t.ctx.Done():
 			return
 		case <-t.closeCh:
 			return
-		case <-flushCh:
-			if !flush() {
-				return
-			}
 		case op := <-t.controlQueues[lane]:
 			if len(op.frame) == 0 {
 				continue
 			}
-			if len(op.frame) > bondedChunkPayloadSize {
-				if !flush() {
-					return
-				}
-				t.lanes[lane].SendData(op.frame)
-				if t.closed.Load() {
-					return
-				}
-				continue
+			if !t.appendLaneCoalescer(lane, op) {
+				return
 			}
-			if len(buf) > 0 && len(buf)+len(op.frame) > bondedChunkPayloadSize {
-				if !flush() {
-					return
-				}
+		}
+	}
+}
+
+func (t *BondedTunnel) appendLaneCoalescer(lane int, op bondedSend) bool {
+	if lane < 0 || lane >= len(t.coalescers) {
+		return false
+	}
+	if len(op.frame) == 0 {
+		return true
+	}
+	if len(op.frame) > bondedChunkPayloadSize {
+		t.logFn("bonded: oversize coalescer frame lane=%d size=%d cap=%d", lane, len(op.frame), bondedChunkPayloadSize)
+		return false
+	}
+
+	shouldFlush := false
+	coalescer := &t.coalescers[lane]
+	coalescer.mu.Lock()
+	if len(coalescer.batch.buf) > 0 && len(coalescer.batch.buf)+len(op.frame) > bondedChunkPayloadSize {
+		shouldFlush = true
+	}
+	coalescer.mu.Unlock()
+	if shouldFlush && !t.flushLaneCoalescer(lane) {
+		return false
+	}
+
+	shouldFlush = false
+	coalescer.mu.Lock()
+	if len(coalescer.batch.buf) == 0 {
+		coalescer.batch.allAppLimited = true
+	}
+	coalescer.batch.buf = append(coalescer.batch.buf, op.frame...)
+	if op.frameID != 0 {
+		coalescer.batch.hasData = true
+		coalescer.batch.lastDataFrameID = op.frameID
+		coalescer.batch.dataFrames++
+		coalescer.batch.allAppLimited = coalescer.batch.allAppLimited && op.appLimited
+	}
+	if len(coalescer.batch.buf) >= bondedChunkPayloadSize {
+		shouldFlush = true
+	}
+	coalescer.mu.Unlock()
+
+	if shouldFlush {
+		return t.flushLaneCoalescer(lane)
+	}
+	return true
+}
+
+func (t *BondedTunnel) flushLaneCoalescer(lane int) bool {
+	if lane < 0 || lane >= len(t.coalescers) {
+		return false
+	}
+	coalescer := &t.coalescers[lane]
+
+	coalescer.mu.Lock()
+	if len(coalescer.batch.buf) == 0 {
+		coalescer.mu.Unlock()
+		return true
+	}
+	payload := make([]byte, len(coalescer.batch.buf))
+	copy(payload, coalescer.batch.buf)
+	meta := coalescer.batch
+	coalescer.batch = bondedBatchState{}
+	coalescer.mu.Unlock()
+
+	if t.closed.Load() {
+		return false
+	}
+	if meta.hasData {
+		t.sendMu.Lock()
+		if lane >= 0 && lane < len(t.laneStates) {
+			state := &t.laneStates[lane]
+			now := time.Now()
+			state.lastSentFrameID = meta.lastDataFrameID
+			state.lastDataSentAt = now
+			state.appLimited = false
+			if !state.roundPending {
+				state.roundPending = true
+				state.roundAppLimited = true
 			}
-			if len(buf) == 0 {
-				if !flushTimer.Stop() {
-					select {
-					case <-flushTimer.C:
-					default:
-					}
-				}
-				flushTimer.Reset(bondedFlushInterval)
-				flushCh = flushTimer.C
-			}
-			buf = append(buf, op.frame...)
-			if len(buf) >= bondedChunkPayloadSize {
-				if !flush() {
-					return
-				}
+			state.nextRoundDelivered = meta.lastDataFrameID
+			state.roundSentFrames += meta.dataFrames
+			state.roundAppLimited = state.roundAppLimited && meta.allAppLimited
+		}
+		t.sendMu.Unlock()
+	}
+	t.lanes[lane].SendData(payload)
+	return !t.closed.Load()
+}
+
+func (t *BondedTunnel) coalescerFlushLoop(lane int) {
+	defer t.wg.Done()
+	if lane < 0 || lane >= len(t.coalescers) {
+		return
+	}
+	ticker := time.NewTicker(bondedFlushInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		case <-t.closeCh:
+			return
+		case <-ticker.C:
+			if !t.flushLaneCoalescer(lane) {
+				return
 			}
 		}
 	}
@@ -2500,6 +2442,11 @@ drainControl:
 func (t *BondedTunnel) resetLaneLocked(index int, now time.Time) {
 	if index < 0 || index >= len(t.laneStates) {
 		return
+	}
+	if index >= 0 && index < len(t.coalescers) {
+		t.coalescers[index].mu.Lock()
+		t.coalescers[index].batch = bondedBatchState{}
+		t.coalescers[index].mu.Unlock()
 	}
 	state := &t.laneStates[index]
 	state.metrics.txBytes.Store(0)
