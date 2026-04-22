@@ -67,6 +67,12 @@ type VKHeadlessJoiner struct {
 	tunnelStarted bool
 	remoteSet     bool
 	pendingICE    []webrtc.ICECandidateInit
+	closed        bool
+
+	reconnectMu      sync.Mutex
+	reconnectTimer   *time.Timer
+	reconnectPending bool
+	reconnectBackoff time.Duration
 }
 
 func NewVKHeadlessJoiner(logFn func(string, ...any), resolveFn ResolveFunc, status StatusEmitter, pcConfig PeerConnectionConfigurer, addTracks AddTunnelTracksFunc, readTrackFn ReadTrackFunc) *VKHeadlessJoiner {
@@ -88,6 +94,15 @@ func (h *VKHeadlessJoiner) RunWithParams(jsonParams string) {
 		return
 	}
 	h.authParams = &params
+	h.closed = false
+	h.reconnectMu.Lock()
+	if h.reconnectTimer != nil {
+		h.reconnectTimer.Stop()
+		h.reconnectTimer = nil
+	}
+	h.reconnectPending = false
+	h.reconnectBackoff = 0
+	h.reconnectMu.Unlock()
 	h.logFn("headless: auth params received")
 	h.logFn("headless:   appVersion=%s protocolVersion=%s", params.AppVersion, params.ProtocolVersion)
 	h.Status.EmitStatus(common.StatusConnecting)
@@ -101,6 +116,18 @@ func (h *VKHeadlessJoiner) RunWithParams(jsonParams string) {
 }
 
 func (h *VKHeadlessJoiner) Close() {
+	h.reconnectMu.Lock()
+	h.closed = true
+	if h.reconnectTimer != nil {
+		h.reconnectTimer.Stop()
+		h.reconnectTimer = nil
+	}
+	h.reconnectPending = false
+	h.reconnectMu.Unlock()
+	h.cleanupCurrent()
+}
+
+func (h *VKHeadlessJoiner) cleanupCurrent() {
 	StopCaptchaProxy()
 	h.vkMu.Lock()
 	ws := h.vkWs
@@ -110,9 +137,71 @@ func (h *VKHeadlessJoiner) Close() {
 		ws.Close()
 	}
 	stopVP8TunnelPool(h.vp8tunnels)
+	h.vp8tunnels = nil
+	h.bondedTunnel = nil
+	h.laneBinder = nil
+	h.tunnelStarted = false
+	h.remoteSet = false
+	h.pendingICE = nil
+	h.remotePeerID = nil
+	h.dc = nil
 	if h.pc != nil {
 		h.pc.Close()
+		h.pc = nil
 	}
+}
+
+func (h *VKHeadlessJoiner) scheduleReconnect(reason string) {
+	h.reconnectMu.Lock()
+	if h.closed || h.reconnectPending {
+		h.reconnectMu.Unlock()
+		return
+	}
+	delay := h.reconnectBackoff
+	if delay <= 0 {
+		delay = 2 * time.Second
+	} else {
+		delay *= 2
+		if delay > 15*time.Second {
+			delay = 15 * time.Second
+		}
+	}
+	h.reconnectBackoff = delay
+	h.reconnectPending = true
+	h.logFn("headless: scheduling reconnect in %s (%s)", delay, reason)
+	h.reconnectTimer = time.AfterFunc(delay, func() { h.performReconnect() })
+	h.reconnectMu.Unlock()
+}
+
+func (h *VKHeadlessJoiner) performReconnect() {
+	h.reconnectMu.Lock()
+	if h.closed {
+		h.reconnectPending = false
+		h.reconnectTimer = nil
+		h.reconnectMu.Unlock()
+		return
+	}
+	h.reconnectMu.Unlock()
+
+	h.logFn("headless: reconnecting")
+	h.cleanupCurrent()
+	h.Status.EmitStatus(common.StatusConnecting)
+	if err := h.joinCall(); err != nil {
+		h.logFn("headless: reconnect joinCall failed: %v", err)
+		h.Status.EmitStatusError(err.Error())
+		h.reconnectMu.Lock()
+		h.reconnectPending = false
+		h.reconnectTimer = nil
+		h.reconnectMu.Unlock()
+		h.scheduleReconnect("joinCall failed")
+		return
+	}
+	h.reconnectMu.Lock()
+	h.reconnectPending = false
+	h.reconnectTimer = nil
+	h.reconnectBackoff = 0
+	h.reconnectMu.Unlock()
+	h.connectSFU()
 }
 
 func (h *VKHeadlessJoiner) joinCall() error {
@@ -286,6 +375,8 @@ func (h *VKHeadlessJoiner) readLoop() {
 		if err != nil {
 			h.logFn("headless: WS closed: %s", common.MaskError(err))
 			h.Status.EmitStatus(common.StatusTunnelLost)
+			h.cleanupCurrent()
+			h.scheduleReconnect("vk ws disconnected")
 			return
 		}
 		if string(msg) == "ping" {
@@ -458,6 +549,9 @@ func (h *VKHeadlessJoiner) initPC() {
 		if state == webrtc.PeerConnectionStateFailed {
 			h.logFn("headless: ERROR: connection failed")
 			h.Status.EmitStatusError("connection failed")
+			h.scheduleReconnect("pc failed")
+		} else if state == webrtc.PeerConnectionStateClosed {
+			h.scheduleReconnect("pc closed")
 		} else if state == webrtc.PeerConnectionStateDisconnected {
 			h.logFn("headless: ERROR: connection lost")
 			h.Status.EmitStatus(common.StatusTunnelLost)
