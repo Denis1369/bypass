@@ -16,15 +16,6 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media"
 )
 
-var vp8Keyframe = []byte{
-	16, 2, 0, 157, 1, 42, 2, 0, 2, 0, 2, 7, 8, 133, 133, 136,
-	153, 132, 136, 11, 2, 0, 12, 13, 96, 0, 254, 252, 173, 16,
-}
-
-var vp8Interframe = []byte{
-	177, 1, 0, 8, 17, 24, 0, 24, 0, 24, 88, 47, 244, 0, 8, 0, 0,
-}
-
 var VP8KeyframeMagic = []byte{
 	0x10,
 	0x00, 0x00,
@@ -33,12 +24,14 @@ var VP8KeyframeMagic = []byte{
 	0xe0, 0x01,
 }
 
+var vp8TunnelSignature = []byte{0xDE, 0xAD, 0xBE, 0xEF}
+
 const (
 	DataFrameMarker     = 0xFF
 	VP8TunnelMaxPayload = 1050
 	vp8DataNonceSize    = 12
 	vp8DataTagSize      = 16
-	vp8PayloadOverhead  = 10 + 1 + vp8DataNonceSize + vp8DataTagSize
+	vp8PayloadOverhead  = 10 + 4 + 1 + vp8DataNonceSize + vp8DataTagSize
 	vp8PayloadSecret    = "whitelist-bypass-vp8-payload-v1"
 )
 
@@ -111,9 +104,11 @@ func (t *VP8DataTunnel) encryptPayload(data []byte) []byte {
 	}
 	nonce := t.nextNonce()
 	ciphertext := aead.Seal(nil, nonce, data, nil)
-	frame := make([]byte, len(VP8KeyframeMagic)+1+len(nonce)+len(ciphertext))
+	frame := make([]byte, len(VP8KeyframeMagic)+len(vp8TunnelSignature)+1+len(nonce)+len(ciphertext))
 	copy(frame, VP8KeyframeMagic)
 	offset := len(VP8KeyframeMagic)
+	copy(frame[offset:], vp8TunnelSignature)
+	offset += len(vp8TunnelSignature)
 	frame[offset] = DataFrameMarker
 	copy(frame[offset+1:], nonce)
 	copy(frame[offset+1+len(nonce):], ciphertext)
@@ -122,12 +117,6 @@ func (t *VP8DataTunnel) encryptPayload(data []byte) []byte {
 
 func (t *VP8DataTunnel) buildFrame(data []byte) []byte {
 	t.frameCount++
-	if len(data) == 0 {
-		if t.frameCount%60 == 0 {
-			return vp8Keyframe
-		}
-		return vp8Interframe
-	}
 	return t.encryptPayload(data)
 }
 
@@ -184,10 +173,6 @@ func (t *VP8DataTunnel) Start(fps int) {
 				} else if t.frameCount <= 10 || t.frameCount%100 == 0 {
 					t.logFn("vp8tunnel: WriteSample DATA ok frame=%d size=%d dataLen=%d first=0x%02x", t.frameCount-1, len(frame), len(data), frame[0])
 				}
-				if t.frameCount%60 == 0 {
-					kf := t.buildFrame(nil)
-					t.track.WriteSample(media.Sample{Data: kf, Duration: keepaliveInterval})
-				}
 				ticker.Reset(keepaliveInterval)
 			case <-ticker.C:
 				lastSend = time.Now()
@@ -215,7 +200,7 @@ func (t *VP8DataTunnel) Stop() {
 }
 
 func ExtractDataFromPayload(payload []byte) []byte {
-	payload = stripVP8KeyframeMagic(payload)
+	payload = extractVP8EncryptedPayload(payload)
 	if len(payload) < 1+vp8DataNonceSize+vp8DataTagSize {
 		return nil
 	}
@@ -232,29 +217,30 @@ func ExtractDataFromPayload(payload []byte) []byte {
 		return nil
 	}
 	plaintext, err := aead.Open(nil, nonce, ciphertext, nil)
-	if err != nil || len(plaintext) == 0 {
+	if err != nil {
 		return nil
 	}
 	return plaintext
 }
 
-func stripVP8KeyframeMagic(payload []byte) []byte {
-	if len(payload) > len(VP8KeyframeMagic) && bytes.Equal(payload[3:6], []byte{0x9d, 0x01, 0x2a}) {
-		return payload[len(VP8KeyframeMagic):]
+func extractVP8EncryptedPayload(payload []byte) []byte {
+	idx := bytes.Index(payload, vp8TunnelSignature)
+	if idx == -1 {
+		return nil
 	}
-	return payload
+	return payload[idx+len(vp8TunnelSignature):]
 }
 
 func LooksLikeVP8TunnelFrame(frame []byte) bool {
 	if len(frame) == 0 {
 		return false
 	}
-	if bytes.Equal(frame, vp8Interframe) || bytes.Equal(frame, vp8Keyframe) {
-		return true
-	}
 	data := ExtractDataFromPayload(frame)
-	if len(data) == 0 {
+	if data == nil {
 		return false
+	}
+	if len(data) == 0 {
+		return true
 	}
 	for len(data) > 0 {
 		next, rest, ok := NextFrame(data)
