@@ -14,9 +14,9 @@ const (
 	bondedDataHeaderSize     = 21
 	bondedWireOverhead       = 9 + bondedDataHeaderSize
 	bondedMaxDataPayloadSize = bondedChunkPayloadSize - bondedWireOverhead
-	bondedMinChunkSize       = 1024
-	bondedInitialChunkSize   = 4096
-	bondedMaxChunkSize       = 16 * 1024
+	bondedMinChunkSize       = 512
+	bondedInitialChunkSize   = bondedMaxDataPayloadSize
+	bondedMaxChunkSize       = bondedMaxDataPayloadSize
 	bondedMinCwndBytes       = 8 * 1024
 	bondedInitialCwndBytes   = 64 * 1024
 	bondedMaxCwndBytes       = 512 * 1024
@@ -129,6 +129,8 @@ type bondedLaneState struct {
 	pacingRate         float64
 	lastAckAt          time.Time
 	nextSendAt         time.Time
+	pacingBudget       float64
+	lastPacingUpdate   time.Time
 	maxBandwidth       float64
 	maxBWSamples       []bondedBandwidthSample
 	ltBandwidth        float64
@@ -350,6 +352,8 @@ func NewBondedTunnel(lanes []DataTunnel, logFn func(string, ...any)) *BondedTunn
 		t.laneStates[i].appLimited = true
 		t.laneStates[i].lastDataSentAt = now
 		t.laneStates[i].lastRxAt = now
+		t.laneStates[i].lastPacingUpdate = now
+		t.laneStates[i].pacingBudget = float64(bondedChunkPayloadSize)
 		t.laneQueues[i] = make(chan bondedSend, bondedPacerQueueSize)
 		t.controlQueues[i] = make(chan bondedSend, bondedControlQueueSize)
 	}
@@ -2075,6 +2079,9 @@ func (t *BondedTunnel) pacerLoop(lane int) {
 			batch.dataFrames++
 			batch.allAppLimited = batch.allAppLimited && op.appLimited
 		}
+		if op.frameID == 0 {
+			return flushBatch()
+		}
 		if len(batch.buf) >= bondedChunkPayloadSize {
 			return flushBatch()
 		}
@@ -2131,22 +2138,51 @@ func (t *BondedTunnel) waitForPacing(lane int, frameSize int, control bool) {
 		if state.pacingRate < bondedMinBwBytes {
 			state.pacingRate = bondedMinBwBytes
 		}
+		if state.lastPacingUpdate.IsZero() {
+			state.lastPacingUpdate = now
+			state.pacingBudget = float64(bondedChunkPayloadSize)
+		}
+		if elapsed := now.Sub(state.lastPacingUpdate); elapsed > 0 {
+			state.pacingBudget += elapsed.Seconds() * state.pacingRate
+			bucketCap := float64(maxInt(frameSize*2, bondedChunkPayloadSize*2))
+			if state.pacingBudget > bucketCap {
+				state.pacingBudget = bucketCap
+			}
+			state.lastPacingUpdate = now
+		}
 		if state.nextSendAt.Before(now) {
 			state.nextSendAt = now
 		}
 		sendAt := state.nextSendAt
-		spacing := time.Duration(float64(frameSize) / state.pacingRate * float64(time.Second))
 		minSpacing := bondedMinSpacing
 		if control {
 			minSpacing = bondedControlMinSpacing
 		}
-		if spacing < minSpacing {
-			spacing = minSpacing
+		deficit := float64(frameSize) - state.pacingBudget
+		if deficit <= 0 && !sendAt.After(now) {
+			state.pacingBudget -= float64(frameSize)
+			if state.pacingBudget < 0 {
+				state.pacingBudget = 0
+			}
+			state.nextSendAt = now.Add(minSpacing)
+			t.sendMu.Unlock()
+			return
 		}
-		state.nextSendAt = sendAt.Add(spacing)
+		waitBudget := time.Duration(0)
+		if deficit > 0 {
+			waitBudget = time.Duration(deficit / state.pacingRate * float64(time.Second))
+		}
+		waitClock := time.Until(sendAt)
+		if waitClock < 0 {
+			waitClock = 0
+		}
+		delay := waitBudget
+		if waitClock > delay {
+			delay = waitClock
+		}
 		t.sendMu.Unlock()
 
-		if delay := time.Until(sendAt); delay > 0 {
+		if delay > 0 {
 			timer := time.NewTimer(delay)
 			select {
 			case <-t.ctx.Done():
@@ -2266,6 +2302,8 @@ func (t *BondedTunnel) resetLaneLocked(index int, now time.Time) {
 	state.pacingRate = bondedInitialBwBytes
 	state.lastAckAt = time.Time{}
 	state.nextSendAt = now
+	state.pacingBudget = float64(bondedChunkPayloadSize)
+	state.lastPacingUpdate = now
 	state.maxBandwidth = bondedInitialBwBytes
 	state.maxBWSamples = nil
 	state.ltBandwidth = bondedInitialBwBytes

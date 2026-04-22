@@ -27,7 +27,7 @@ var vp8Interframe = []byte{
 
 const (
 	DataFrameMarker     = 0xFF
-	VP8TunnelMaxPayload = 1100
+	VP8TunnelMaxPayload = 1050
 	vp8DataNonceSize    = 12
 	vp8DataTagSize      = 16
 	vp8PayloadOverhead  = 1 + vp8DataNonceSize + vp8DataTagSize
