@@ -49,6 +49,7 @@ const (
 	bondedPingRetention     = 5 * time.Second
 	bondedCriticalRTT       = 800 * time.Millisecond
 	bondedRecoverRTT        = 350 * time.Millisecond
+	bondedRTOInterval       = 150 * time.Millisecond
 	bondedLossRoundThresh   = 0.03
 	bondedLossSevereThresh  = 0.05
 	bondedDeadPingThreshold = 10
@@ -371,6 +372,8 @@ func NewBondedTunnel(lanes []DataTunnel, logFn func(string, ...any)) *BondedTunn
 	}
 	t.wg.Add(1)
 	go t.gapLoop()
+	t.wg.Add(1)
+	go t.rtoLoop()
 	t.wg.Add(1)
 	go t.qualityLoop()
 	t.wg.Add(1)
@@ -1128,6 +1131,63 @@ func (t *BondedTunnel) gapLoop() {
 			if req.connID != 0 {
 				t.resetDamagedFlow(req.connID, req.msgType, "hard-timeout")
 			}
+		}
+	}
+}
+
+func (t *BondedTunnel) rtoLoop() {
+	defer t.wg.Done()
+	ticker := time.NewTicker(bondedRTOInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+		case <-t.ctx.Done():
+			return
+		case <-t.closeCh:
+			return
+		}
+
+		now := time.Now()
+		var ops []bondedSend
+		type dropRequest struct {
+			frameID uint64
+			connID  uint32
+			msgType byte
+		}
+		drops := make([]dropRequest, 0, 4)
+
+		t.sendMu.Lock()
+		for _, entry := range t.history {
+			rto := t.historyRTOForEntryLocked(entry)
+			if now.Sub(entry.sentAt) < rto {
+				continue
+			}
+			t.releaseHistoryInflightLocked(entry)
+			if entry.retransmits >= bondedMaxRetransmits || now.Sub(entry.sentAt) > bondedHistoryTTL {
+				t.penalizeHistoryLocked(entry, 0.20)
+				t.markHistorySkippedLocked(entry)
+				delete(t.history, entry.frameID)
+				drops = append(drops, dropRequest{frameID: entry.frameID, connID: entry.connID, msgType: entry.msgType})
+				continue
+			}
+			t.penalizeHistoryLocked(entry, 0.08)
+			entry.retransmits++
+			entry.sentAt = now
+			ops = append(ops, t.planFrameSendLocked(entry, true)...)
+		}
+		if len(ops) > 0 || len(drops) > 0 {
+			t.sendCond.Broadcast()
+		}
+		t.sendMu.Unlock()
+
+		for _, req := range drops {
+			t.sendBondedDrop(req.frameID, req.connID, req.msgType)
+			t.resetDamagedFlow(req.connID, req.msgType, "rto-timeout")
+		}
+		if len(ops) > 0 {
+			go t.sendOps(ops)
 		}
 	}
 }
@@ -2095,21 +2155,10 @@ func (t *BondedTunnel) pacerLoop(lane int) {
 			batch.dataFrames++
 			batch.allAppLimited = batch.allAppLimited && op.appLimited
 		}
-		if op.frameID == 0 {
-			return flushBatch()
-		}
 		if len(batch.buf) >= bondedChunkPayloadSize {
 			return flushBatch()
 		}
 		return true
-	}
-
-	sendControlImmediate := func(op bondedSend) bool {
-		if len(op.frame) == 0 {
-			return true
-		}
-		t.lanes[lane].SendData(op.frame)
-		return !t.closed.Load()
 	}
 
 	for {
@@ -2125,10 +2174,6 @@ func (t *BondedTunnel) pacerLoop(lane int) {
 			}
 			continue
 		case op = <-t.controlQueues[lane]:
-			if !sendControlImmediate(op) {
-				return
-			}
-			continue
 		default:
 			select {
 			case <-t.ctx.Done():
@@ -2141,10 +2186,6 @@ func (t *BondedTunnel) pacerLoop(lane int) {
 				}
 				continue
 			case op = <-t.controlQueues[lane]:
-				if !sendControlImmediate(op) {
-					return
-				}
-				continue
 			case op = <-t.laneQueues[lane]:
 			}
 		}
@@ -2290,6 +2331,31 @@ func (t *BondedTunnel) pruneHistoryLocked(now time.Time) {
 		delete(t.history, frameID)
 		t.historyOrder = t.historyOrder[1:]
 	}
+}
+
+func (t *BondedTunnel) historyRTOForEntryLocked(entry *bondedHistoryEntry) time.Duration {
+	rto := time.Second
+	for _, lane := range uniqueLanes(entry.chunkLanes) {
+		if lane < 0 || lane >= len(t.laneStates) {
+			continue
+		}
+		state := &t.laneStates[lane]
+		rtt := state.smoothedRTT
+		if rtt <= 0 {
+			rtt = state.lastRTT
+		}
+		if rtt <= 0 {
+			continue
+		}
+		candidate := 4 * rtt
+		if candidate > rto {
+			rto = candidate
+		}
+	}
+	if rto < time.Second {
+		rto = time.Second
+	}
+	return rto
 }
 
 func (t *BondedTunnel) collectLaneRescueEntriesLocked(index int) []*bondedHistoryEntry {
