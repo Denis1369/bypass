@@ -98,8 +98,17 @@ func (t *VP8DataTunnel) SendEmergencyKeyframe() {
 	// realistic keyframe-sized payload, while the receiver can still parse it as
 	// a legitimate tunnel NOOP frame.
 	const emergencyNoopPayloadSize = 900
-	t.forceKeyframe.Store(true)
-	frameID, frame, err := t.writeSampleDirect(buildVP8TunnelNoopFrame(emergencyNoopPayloadSize), 20*time.Millisecond)
+	payload := buildVP8TunnelNoopFrame(emergencyNoopPayloadSize)
+	t.writeMu.Lock()
+	t.frameCount++
+	frame := t.encryptPayload(payload, true)
+	frameID := t.frameCount - 1
+	if len(frame) == 0 {
+		t.writeMu.Unlock()
+		return
+	}
+	err := t.track.WriteSample(media.Sample{Data: frame, Duration: 20 * time.Millisecond})
+	t.writeMu.Unlock()
 	if err != nil {
 		if t.logFn != nil {
 			t.logFn("vp8tunnel: emergency keyframe error: %v (frame %d, %d bytes)", err, frameID, len(frame))
@@ -131,7 +140,7 @@ func (t *VP8DataTunnel) nextNonce() []byte {
 	return nonce
 }
 
-func (t *VP8DataTunnel) encryptPayload(data []byte) []byte {
+func (t *VP8DataTunnel) encryptPayload(data []byte, forceKeyframe bool) []byte {
 	aead, err := vp8PayloadAEAD()
 	if err != nil {
 		if t.logFn != nil {
@@ -142,7 +151,7 @@ func (t *VP8DataTunnel) encryptPayload(data []byte) []byte {
 	nonce := t.nextNonce()
 	ciphertext := aead.Seal(nil, nonce, data, nil)
 	prefix := vp8InterframeMagic
-	if t.forceKeyframe.Swap(false) || t.frameCount%60 == 0 {
+	if forceKeyframe || t.forceKeyframe.Swap(false) || t.frameCount%60 == 0 {
 		prefix = VP8KeyframeMagic
 	}
 	frame := make([]byte, len(prefix)+len(vp8TunnelSignature)+1+len(nonce)+len(ciphertext))
@@ -158,7 +167,7 @@ func (t *VP8DataTunnel) encryptPayload(data []byte) []byte {
 
 func (t *VP8DataTunnel) buildFrame(data []byte) []byte {
 	t.frameCount++
-	return t.encryptPayload(data)
+	return t.encryptPayload(data, false)
 }
 
 func (t *VP8DataTunnel) writeSampleDirect(data []byte, duration time.Duration) (uint64, []byte, error) {
