@@ -409,7 +409,7 @@ func StartRTCPFeedbackReaders(pc *webrtc.PeerConnection, tracks []*webrtc.TrackL
 				for _, packet := range packets {
 					switch packet.(type) {
 					case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
-						lane.ForceNextKeyframe()
+						lane.SendEmergencyKeyframe()
 						if logFn != nil {
 							logFn("%s: RTCP keyframe request track=%s packet=%T", prefix, trackID, packet)
 						}

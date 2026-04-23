@@ -63,6 +63,7 @@ func vp8PayloadAEAD() (cipher.AEAD, error) {
 type VP8DataTunnel struct {
 	track         *webrtc.TrackLocalStaticSample
 	mu            sync.Mutex
+	writeMu       sync.Mutex
 	logFn         func(string, ...any)
 	frameCount    uint64
 	running       bool
@@ -81,6 +82,22 @@ type VP8DataTunnel struct {
 func (t *VP8DataTunnel) SetOnData(fn func([]byte)) { t.OnData = fn }
 func (t *VP8DataTunnel) SetOnClose(fn func())      { t.OnClose = fn }
 func (t *VP8DataTunnel) ForceNextKeyframe()        { t.forceKeyframe.Store(true) }
+func (t *VP8DataTunnel) SendEmergencyKeyframe() {
+	if t.ctx.Err() != nil {
+		return
+	}
+	t.forceKeyframe.Store(true)
+	frameID, frame, err := t.writeSampleDirect(nil, 20*time.Millisecond)
+	if err != nil {
+		if t.logFn != nil {
+			t.logFn("vp8tunnel: emergency keyframe error: %v (frame %d, %d bytes)", err, frameID, len(frame))
+		}
+		return
+	}
+	if t.logFn != nil {
+		t.logFn("vp8tunnel: emergency keyframe sent frame=%d size=%d", frameID, len(frame))
+	}
+}
 
 func NewVP8DataTunnel(track *webrtc.TrackLocalStaticSample, logFn func(string, ...any)) *VP8DataTunnel {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -132,6 +149,18 @@ func (t *VP8DataTunnel) buildFrame(data []byte) []byte {
 	return t.encryptPayload(data)
 }
 
+func (t *VP8DataTunnel) writeSampleDirect(data []byte, duration time.Duration) (uint64, []byte, error) {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	frame := t.buildFrame(data)
+	if len(frame) == 0 {
+		return 0, nil, nil
+	}
+	frameID := t.frameCount - 1
+	err := t.track.WriteSample(media.Sample{Data: frame, Duration: duration})
+	return frameID, frame, err
+}
+
 var sendCount atomic.Uint64
 
 func (t *VP8DataTunnel) SendData(data []byte) {
@@ -174,24 +203,25 @@ func (t *VP8DataTunnel) Start(fps int) {
 				if elapsed < minInterval {
 					time.Sleep(minInterval - elapsed)
 				}
-				frame := t.buildFrame(data)
+				frameID, frame, err := t.writeSampleDirect(data, keepaliveInterval)
 				if len(frame) == 0 {
 					continue
 				}
-				err := t.track.WriteSample(media.Sample{Data: frame, Duration: keepaliveInterval})
 				lastSend = time.Now()
 				if err != nil {
-					t.logFn("vp8tunnel: WriteSample DATA error: %v (frame %d, %d bytes)", err, t.frameCount-1, len(frame))
-				} else if t.frameCount <= 10 || t.frameCount%100 == 0 {
-					t.logFn("vp8tunnel: WriteSample DATA ok frame=%d size=%d dataLen=%d first=0x%02x", t.frameCount-1, len(frame), len(data), frame[0])
+					t.logFn("vp8tunnel: WriteSample DATA error: %v (frame %d, %d bytes)", err, frameID, len(frame))
+				} else if frameID <= 10 || frameID%100 == 0 {
+					t.logFn("vp8tunnel: WriteSample DATA ok frame=%d size=%d dataLen=%d first=0x%02x", frameID, len(frame), len(data), frame[0])
 				}
 				ticker.Reset(keepaliveInterval)
 			case <-ticker.C:
 				lastSend = time.Now()
-				frame := t.buildFrame(nil)
-				err := t.track.WriteSample(media.Sample{Data: frame, Duration: keepaliveInterval})
-				if t.frameCount <= 3 || t.frameCount%500 == 0 {
-					t.logFn("vp8tunnel: KEEPALIVE frame=%d first=0x%02x err=%v", t.frameCount-1, frame[0], err)
+				frameID, frame, err := t.writeSampleDirect(nil, keepaliveInterval)
+				if len(frame) == 0 {
+					continue
+				}
+				if frameID <= 3 || frameID%500 == 0 {
+					t.logFn("vp8tunnel: KEEPALIVE frame=%d first=0x%02x err=%v", frameID, frame[0], err)
 				}
 			}
 		}
