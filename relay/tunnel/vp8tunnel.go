@@ -83,16 +83,23 @@ func (t *VP8DataTunnel) SetOnData(fn func([]byte)) { t.OnData = fn }
 func (t *VP8DataTunnel) SetOnClose(fn func())      { t.OnClose = fn }
 func (t *VP8DataTunnel) ForceNextKeyframe()        { t.forceKeyframe.Store(true) }
 
-func buildVP8TunnelNoopFrame() []byte {
-	return EncodeFrame(BondedConnID, MsgNoop, nil)
+func buildVP8TunnelNoopFrame(payloadSize int) []byte {
+	if payloadSize < 0 {
+		payloadSize = 0
+	}
+	return EncodeFrame(BondedConnID, MsgNoop, make([]byte, payloadSize))
 }
 
 func (t *VP8DataTunnel) SendEmergencyKeyframe() {
 	if t.ctx.Err() != nil {
 		return
 	}
+	// Send a "fat" but still valid tunnel frame so SFU-side heuristics see a
+	// realistic keyframe-sized payload, while the receiver can still parse it as
+	// a legitimate tunnel NOOP frame.
+	const emergencyNoopPayloadSize = 900
 	t.forceKeyframe.Store(true)
-	frameID, frame, err := t.writeSampleDirect(buildVP8TunnelNoopFrame(), 20*time.Millisecond)
+	frameID, frame, err := t.writeSampleDirect(buildVP8TunnelNoopFrame(emergencyNoopPayloadSize), 20*time.Millisecond)
 	if err != nil {
 		if t.logFn != nil {
 			t.logFn("vp8tunnel: emergency keyframe error: %v (frame %d, %d bytes)", err, frameID, len(frame))
@@ -221,7 +228,7 @@ func (t *VP8DataTunnel) Start(fps int) {
 				ticker.Reset(keepaliveInterval)
 			case <-ticker.C:
 				lastSend = time.Now()
-				frameID, frame, err := t.writeSampleDirect(buildVP8TunnelNoopFrame(), keepaliveInterval)
+				frameID, frame, err := t.writeSampleDirect(buildVP8TunnelNoopFrame(0), keepaliveInterval)
 				if len(frame) == 0 {
 					continue
 				}
