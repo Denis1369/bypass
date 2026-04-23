@@ -310,12 +310,13 @@ type BondedTunnel struct {
 	retiredOrder       []uint64
 	flows              map[uint32]*bondedFlowState
 
-	closeCh   chan struct{}
-	closeOnce sync.Once
-	closed    atomic.Bool
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
+	closeCh     chan struct{}
+	closeOnce   sync.Once
+	closed      atomic.Bool
+	queuedBytes atomic.Int64
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
 }
 
 func NewBondedTunnel(lanes []DataTunnel, logFn func(string, ...any)) *BondedTunnel {
@@ -460,6 +461,28 @@ func (t *BondedTunnel) LaneHealthSnapshots() []LaneHealthSnapshot {
 		}
 	}
 	return snapshots
+}
+
+func (t *BondedTunnel) GetTotalBufferUsage() int {
+	inflight := 0
+	t.sendMu.Lock()
+	for i := range t.laneStates {
+		inflight += t.laneStates[i].inflightBytes
+	}
+	t.sendMu.Unlock()
+
+	coalesced := 0
+	for i := range t.coalescers {
+		t.coalescers[i].mu.Lock()
+		coalesced += len(t.coalescers[i].batch.buf)
+		t.coalescers[i].mu.Unlock()
+	}
+
+	queued := t.queuedBytes.Load()
+	if queued < 0 {
+		queued = 0
+	}
+	return inflight + coalesced + int(queued)
 }
 
 func (t *BondedTunnel) ResetLane(index int) {
@@ -2056,8 +2079,10 @@ func (t *BondedTunnel) sendOps(ops []bondedSend) {
 		if t.closed.Load() {
 			return
 		}
+		t.queuedBytes.Add(int64(len(op.frame)))
 		select {
 		case <-t.closeCh:
+			t.queuedBytes.Add(-int64(len(op.frame)))
 			return
 		case t.laneQueues[op.lane] <- op:
 		}
@@ -2077,6 +2102,7 @@ func (t *BondedTunnel) pacerLoop(lane int) {
 		case <-t.closeCh:
 			return
 		case op = <-t.laneQueues[lane]:
+			t.queuedBytes.Add(-int64(len(op.frame)))
 		default:
 			select {
 			case <-t.ctx.Done():
@@ -2084,6 +2110,7 @@ func (t *BondedTunnel) pacerLoop(lane int) {
 			case <-t.closeCh:
 				return
 			case op = <-t.laneQueues[lane]:
+				t.queuedBytes.Add(-int64(len(op.frame)))
 			}
 		}
 		t.waitForPacing(lane, len(op.frame), false)
@@ -2108,6 +2135,7 @@ func (t *BondedTunnel) controlLoop(lane int) {
 		case <-t.closeCh:
 			return
 		case op := <-t.controlQueues[lane]:
+			t.queuedBytes.Add(-int64(len(op.frame)))
 			if len(op.frame) == 0 {
 				continue
 			}
@@ -2530,8 +2558,10 @@ func (t *BondedTunnel) enqueueControl(op bondedSend) {
 	if op.lane < 0 || op.lane >= len(t.controlQueues) {
 		return
 	}
+	t.queuedBytes.Add(int64(len(op.frame)))
 	select {
 	case <-t.closeCh:
+		t.queuedBytes.Add(-int64(len(op.frame)))
 		return
 	case t.controlQueues[op.lane] <- op:
 	}

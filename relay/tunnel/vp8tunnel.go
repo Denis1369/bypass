@@ -99,24 +99,32 @@ func (t *VP8DataTunnel) SendEmergencyKeyframe() {
 	// a legitimate tunnel NOOP frame.
 	const emergencyNoopPayloadSize = 900
 	payload := buildVP8TunnelNoopFrame(emergencyNoopPayloadSize)
-	t.writeMu.Lock()
-	t.frameCount++
-	frame := t.encryptPayload(payload, true)
-	frameID := t.frameCount - 1
-	if len(frame) == 0 {
-		t.writeMu.Unlock()
-		return
-	}
-	err := t.track.WriteSample(media.Sample{Data: frame, Duration: 20 * time.Millisecond})
-	t.writeMu.Unlock()
-	if err != nil {
-		if t.logFn != nil {
-			t.logFn("vp8tunnel: emergency keyframe error: %v (frame %d, %d bytes)", err, frameID, len(frame))
+	for attempt := 1; attempt <= 3; attempt++ {
+		if t.ctx.Err() != nil {
+			return
 		}
-		return
-	}
-	if t.logFn != nil {
-		t.logFn("vp8tunnel: emergency keyframe sent frame=%d size=%d", frameID, len(frame))
+		t.writeMu.Lock()
+		t.frameCount++
+		frame := t.encryptPayload(payload, true)
+		frameID := t.frameCount - 1
+		if len(frame) == 0 {
+			t.writeMu.Unlock()
+			return
+		}
+		err := t.track.WriteSample(media.Sample{Data: frame, Duration: 20 * time.Millisecond})
+		t.writeMu.Unlock()
+		if err != nil {
+			if t.logFn != nil {
+				t.logFn("vp8tunnel: emergency keyframe error: %v (attempt %d, frame %d, %d bytes)", err, attempt, frameID, len(frame))
+			}
+			return
+		}
+		if t.logFn != nil {
+			t.logFn("vp8tunnel: emergency keyframe sent attempt=%d frame=%d size=%d", attempt, frameID, len(frame))
+		}
+		if attempt < 3 {
+			time.Sleep(2 * time.Millisecond)
+		}
 	}
 }
 

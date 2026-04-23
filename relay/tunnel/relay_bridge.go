@@ -14,6 +14,11 @@ import (
 	"whitelist-bypass/relay/common"
 )
 
+const (
+	relayBackpressureThreshold = 2 * 1024 * 1024
+	relayBackpressureSleep     = 10 * time.Millisecond
+)
+
 type udpClient struct {
 	udpConn    *net.UDPConn
 	clientAddr *net.UDPAddr
@@ -91,6 +96,24 @@ func (rb *RelayBridge) MarkReady() {
 func (rb *RelayBridge) send(connID uint32, msgType byte, payload []byte) {
 	frame := EncodeFrame(connID, msgType, payload)
 	rb.tunnel.SendData(frame)
+}
+
+func (rb *RelayBridge) waitForTunnelCapacity() bool {
+	reporter, ok := rb.tunnel.(BufferUsageReporter)
+	if !ok {
+		return true
+	}
+	for {
+		select {
+		case <-rb.ctx.Done():
+			return false
+		default:
+		}
+		if reporter.GetTotalBufferUsage() <= relayBackpressureThreshold {
+			return true
+		}
+		time.Sleep(relayBackpressureSleep)
+	}
 }
 
 func (rb *RelayBridge) handleTunnelData(data []byte) {
@@ -209,6 +232,10 @@ func (rb *RelayBridge) connectTCP(connID uint32, addr string) {
 			closedByContext = true
 			goto done
 		default:
+		}
+		if !rb.waitForTunnelCapacity() {
+			closedByContext = true
+			goto done
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 		n, err := conn.Read(buf)
@@ -352,6 +379,9 @@ func (rb *RelayBridge) handleSOCKS(conn net.Conn) {
 			case <-rb.ctx.Done():
 				return
 			default:
+			}
+			if !rb.waitForTunnelCapacity() {
+				return
 			}
 			_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 			rn, rerr := conn.Read(readBuf)
