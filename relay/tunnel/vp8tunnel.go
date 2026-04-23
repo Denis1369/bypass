@@ -24,6 +24,11 @@ var VP8KeyframeMagic = []byte{
 	0xe0, 0x01,
 }
 
+var vp8InterframeMagic = []byte{
+	0xb1, 0x01, 0x00, 0x08, 0x11, 0x18, 0x00, 0x18, 0x00,
+	0x18, 0x58, 0x2f, 0xf4, 0x00, 0x08, 0x00, 0x00,
+}
+
 var vp8TunnelSignature = []byte{0xDE, 0xAD, 0xBE, 0xEF}
 
 const (
@@ -31,7 +36,8 @@ const (
 	VP8TunnelMaxPayload = 1050
 	vp8DataNonceSize    = 12
 	vp8DataTagSize      = 16
-	vp8PayloadOverhead  = 10 + 4 + 1 + vp8DataNonceSize + vp8DataTagSize
+	vp8PrefixMaxLen     = 17
+	vp8PayloadOverhead  = vp8PrefixMaxLen + 4 + 1 + vp8DataNonceSize + vp8DataTagSize
 	vp8PayloadSecret    = "whitelist-bypass-vp8-payload-v1"
 )
 
@@ -104,9 +110,13 @@ func (t *VP8DataTunnel) encryptPayload(data []byte) []byte {
 	}
 	nonce := t.nextNonce()
 	ciphertext := aead.Seal(nil, nonce, data, nil)
-	frame := make([]byte, len(VP8KeyframeMagic)+len(vp8TunnelSignature)+1+len(nonce)+len(ciphertext))
-	copy(frame, VP8KeyframeMagic)
-	offset := len(VP8KeyframeMagic)
+	prefix := vp8InterframeMagic
+	if t.frameCount%60 == 0 {
+		prefix = VP8KeyframeMagic
+	}
+	frame := make([]byte, len(prefix)+len(vp8TunnelSignature)+1+len(nonce)+len(ciphertext))
+	copy(frame, prefix)
+	offset := len(prefix)
 	copy(frame[offset:], vp8TunnelSignature)
 	offset += len(vp8TunnelSignature)
 	frame[offset] = DataFrameMarker

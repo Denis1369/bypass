@@ -24,6 +24,7 @@ const (
 	bondedInitialBwBytes     = 512 * 1024
 	bondedMinBwBytes         = 64 * 1024
 	bondedMaxBwBytes         = 32 * 1024 * 1024
+	bondedMaxLaneRateBytes   = 120 * 1024
 	bondedProbeGain          = 1.20
 	bondedProbePeriod        = 4 * time.Second
 	bondedProbeDuration      = 800 * time.Millisecond
@@ -1395,7 +1396,7 @@ func (s *bondedLaneState) recomputeLaneBudgetLocked(now time.Time, holdChunk boo
 		effectiveCwndGain *= 0.75
 	}
 
-	s.pacingRate = clampFloat(maxBW*effectivePacingGain, bondedMinBwBytes, bondedMaxBwBytes*bondedProbeGain)
+	s.pacingRate = clampFloat(maxBW*effectivePacingGain, bondedMinBwBytes, bondedMaxLaneRateBytes)
 	targetCwnd := int(maxBW*baseRTT.Seconds()*effectiveCwndGain) + bondedMinChunkSize
 	if s.bbrState == bondedBBRProbeRTT {
 		targetCwnd = bondedMinCwndBytes
@@ -2241,6 +2242,9 @@ func (t *BondedTunnel) waitForPacing(lane int, frameSize int, _ bool) {
 		now := time.Now()
 		if state.pacingRate < bondedMinBwBytes {
 			state.pacingRate = bondedMinBwBytes
+		}
+		if state.pacingRate > bondedMaxLaneRateBytes {
+			state.pacingRate = bondedMaxLaneRateBytes
 		}
 		if state.lastPacingUpdate.IsZero() {
 			state.lastPacingUpdate = now
