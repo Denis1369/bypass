@@ -82,12 +82,17 @@ type VP8DataTunnel struct {
 func (t *VP8DataTunnel) SetOnData(fn func([]byte)) { t.OnData = fn }
 func (t *VP8DataTunnel) SetOnClose(fn func())      { t.OnClose = fn }
 func (t *VP8DataTunnel) ForceNextKeyframe()        { t.forceKeyframe.Store(true) }
+
+func buildVP8TunnelNoopFrame() []byte {
+	return EncodeFrame(BondedConnID, MsgNoop, nil)
+}
+
 func (t *VP8DataTunnel) SendEmergencyKeyframe() {
 	if t.ctx.Err() != nil {
 		return
 	}
 	t.forceKeyframe.Store(true)
-	frameID, frame, err := t.writeSampleDirect(nil, 20*time.Millisecond)
+	frameID, frame, err := t.writeSampleDirect(buildVP8TunnelNoopFrame(), 20*time.Millisecond)
 	if err != nil {
 		if t.logFn != nil {
 			t.logFn("vp8tunnel: emergency keyframe error: %v (frame %d, %d bytes)", err, frameID, len(frame))
@@ -216,7 +221,7 @@ func (t *VP8DataTunnel) Start(fps int) {
 				ticker.Reset(keepaliveInterval)
 			case <-ticker.C:
 				lastSend = time.Now()
-				frameID, frame, err := t.writeSampleDirect(nil, keepaliveInterval)
+				frameID, frame, err := t.writeSampleDirect(buildVP8TunnelNoopFrame(), keepaliveInterval)
 				if len(frame) == 0 {
 					continue
 				}

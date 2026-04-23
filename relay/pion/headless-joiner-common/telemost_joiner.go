@@ -549,6 +549,16 @@ func (j *TelemostHeadlessJoiner) handlePubAnswer(sdp string) {
 	if j.pubPC == nil {
 		return
 	}
+	if j.pubRemoteSet {
+		if remote := j.pubPC.RemoteDescription(); remote != nil && remote.Type == webrtc.SDPTypeAnswer && remote.SDP == sdp {
+			j.logFn("telemost-joiner: ignoring duplicate publisherSdpAnswer")
+			return
+		}
+		if j.pubPC.SignalingState() == webrtc.SignalingStateStable {
+			j.logFn("telemost-joiner: skipping late publisherSdpAnswer in stable state")
+			return
+		}
+	}
 	err := j.pubPC.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeAnswer,
 		SDP:  sdp,

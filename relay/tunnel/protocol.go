@@ -10,6 +10,7 @@ const (
 	MsgClose      byte = 0x05
 	MsgUDP        byte = 0x06
 	MsgUDPReply   byte = 0x07
+	MsgNoop       byte = 0x08
 	MsgBondedData byte = 0x40
 	MsgBondedNack byte = 0x41
 	MsgBondedDrop byte = 0x42
@@ -20,7 +21,7 @@ const (
 
 func IsKnownMsgType(msgType byte) bool {
 	switch msgType {
-	case MsgConnect, MsgConnectOK, MsgConnectErr, MsgData, MsgClose, MsgUDP, MsgUDPReply,
+	case MsgConnect, MsgConnectOK, MsgConnectErr, MsgData, MsgClose, MsgUDP, MsgUDPReply, MsgNoop,
 		MsgBondedData, MsgBondedNack, MsgBondedDrop, MsgBondedPing, MsgBondedPong, MsgBondedAck:
 		return true
 	default:

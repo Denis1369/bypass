@@ -621,6 +621,16 @@ func (h *VKHeadlessJoiner) onTransmittedData(data map[string]interface{}) {
 		h.logFn("headless: remote SDP: %s", sdpType)
 
 		if sdpType == "answer" {
+			if h.remoteSet {
+				if remote := h.pc.RemoteDescription(); remote != nil && remote.Type == webrtc.SDPTypeAnswer && remote.SDP == sdpStr {
+					h.logFn("headless: ignoring duplicate answer")
+					return
+				}
+				if h.pc.SignalingState() == webrtc.SignalingStateStable {
+					h.logFn("headless: skipping late answer in stable state")
+					return
+				}
+			}
 			h.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: sdpStr})
 			h.remoteSet = true
 			for _, candidate := range h.pendingICE {
