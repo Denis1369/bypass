@@ -22,9 +22,10 @@ import (
 )
 
 const (
-	TmAPIBase    = "https://cloud-api.yandex.ru/telemost_front/v2/telemost"
-	TmOrigin     = "https://telemost.yandex.ru"
-	TmPingPeriod = 5 * time.Second
+	TmAPIBase                      = "https://cloud-api.yandex.ru/telemost_front/v2/telemost"
+	TmOrigin                       = "https://telemost.yandex.ru"
+	TmPingPeriod                   = 5 * time.Second
+	zombieLanePingTimeoutThreshold = 20
 )
 
 type TelemostHeadlessJoiner struct {
@@ -217,6 +218,31 @@ func (j *TelemostHeadlessJoiner) performReconnect() {
 	j.reconnectBackoff = 0
 	j.reconnectMu.Unlock()
 	j.connectAndRun()
+}
+
+func (j *TelemostHeadlessJoiner) startZombieLaneMonitor(dt tunnel.DataTunnel) {
+	reporter, ok := dt.(tunnel.LaneHealthProvider)
+	if !ok || reporter == nil {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			<-ticker.C
+			if j.closed.Load() || j.bondedTunnel != dt {
+				return
+			}
+			for _, snap := range reporter.LaneHealthSnapshots() {
+				if snap.PingTimeout <= zombieLanePingTimeoutThreshold {
+					continue
+				}
+				j.logFn("telemost-joiner: zombie lane detected index=%d pingTimeout=%d, reconnecting", snap.Index, snap.PingTimeout)
+				j.scheduleReconnect("zombie lane")
+				return
+			}
+		}
+	}()
 }
 
 func (j *TelemostHeadlessJoiner) makeHTTPClient() *http.Client {
@@ -508,6 +534,7 @@ func (j *TelemostHeadlessJoiner) initPC() {
 			j.Status.EmitStatus(common.StatusTunnelConnected)
 			startVP8TunnelPool(j.vp8tunnels, 25)
 			j.tunnelStarted = true
+			j.startZombieLaneMonitor(j.bondedTunnel)
 			if j.OnConnected != nil && j.bondedTunnel != nil {
 				j.OnConnected(j.bondedTunnel)
 			}

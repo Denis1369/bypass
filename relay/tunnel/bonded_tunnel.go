@@ -28,8 +28,8 @@ const (
 	bondedProbeGain          = 1.20
 	bondedProbePeriod        = 4 * time.Second
 	bondedProbeDuration      = 800 * time.Millisecond
-	bondedPacerQueueSize     = 2048
-	bondedControlQueueSize   = 256
+	bondedPacerQueueSize     = 128
+	bondedControlQueueSize   = 128
 	bondedMinSpacing         = 200 * time.Microsecond
 	bondedControlMinSpacing  = time.Millisecond
 	bondedFlushInterval      = 3 * time.Millisecond
@@ -38,6 +38,7 @@ const (
 	bondedNackRetryInterval = 120 * time.Millisecond
 	bondedHardTimeout       = 1500 * time.Millisecond
 	bondedMaxRetransmits    = 3
+	bondedMaxRTORetries     = 5
 	bondedHistoryTTL        = 5 * time.Second
 	bondedHistoryMaxFrames  = 4096
 	bondedRetiredTTL        = 5 * time.Second
@@ -1201,7 +1202,8 @@ func (t *BondedTunnel) rtoLoop() {
 				continue
 			}
 			t.releaseHistoryInflightLocked(entry)
-			if entry.retries >= 5 || now.Sub(entry.sentAt) > bondedHistoryTTL {
+			entry.retries++
+			if entry.retries > bondedMaxRTORetries || now.Sub(entry.sentAt) > bondedHistoryTTL {
 				t.penalizeHistoryLocked(entry, 0.20)
 				t.markHistorySkippedLocked(entry)
 				delete(t.history, entry.frameID)
@@ -1210,7 +1212,6 @@ func (t *BondedTunnel) rtoLoop() {
 			}
 			t.penalizeHistoryLocked(entry, 0.08)
 			entry.retransmits++
-			entry.retries++
 			entry.sentAt = now
 			ops = append(ops, t.planFrameSendLocked(entry, true)...)
 		}
@@ -2061,11 +2062,7 @@ func (t *BondedTunnel) sendOps(ops []bondedSend) {
 				return
 			}
 			state := &t.laneStates[op.lane]
-			cwndLimit := state.cwndBytes
-			if op.retransmit {
-				cwndLimit += 10 * bondedMaxChunkSize
-			}
-			if state.inflightBytes+len(op.frame) <= cwndLimit {
+			if state.inflightBytes+len(op.frame) <= state.cwndBytes {
 				state.inflightBytes += len(op.frame)
 				state.metrics.txBytes.Add(uint64(len(op.frame)))
 				if op.retransmit {

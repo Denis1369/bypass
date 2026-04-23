@@ -204,6 +204,33 @@ func (h *VKHeadlessJoiner) performReconnect() {
 	h.connectSFU()
 }
 
+func (h *VKHeadlessJoiner) startZombieLaneMonitor(dt tunnel.DataTunnel) {
+	reporter, ok := dt.(tunnel.LaneHealthProvider)
+	if !ok || reporter == nil {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			h.reconnectMu.Lock()
+			closed := h.closed
+			h.reconnectMu.Unlock()
+			if closed || h.bondedTunnel != dt {
+				return
+			}
+			for _, snap := range reporter.LaneHealthSnapshots() {
+				if snap.PingTimeout <= zombieLanePingTimeoutThreshold {
+					continue
+				}
+				h.logFn("headless: zombie lane detected index=%d pingTimeout=%d, reconnecting", snap.Index, snap.PingTimeout)
+				h.scheduleReconnect("zombie lane")
+				return
+			}
+		}
+	}()
+}
+
 func (h *VKHeadlessJoiner) joinCall() error {
 	apiURL := h.authParams.APIBaseURL
 	parsed, err := url.Parse(apiURL)
@@ -562,6 +589,7 @@ func (h *VKHeadlessJoiner) initPC() {
 			h.Status.EmitStatus(common.StatusTunnelConnected)
 			startVP8TunnelPool(h.vp8tunnels, 25)
 			h.tunnelStarted = true
+			h.startZombieLaneMonitor(h.bondedTunnel)
 			if h.OnConnected != nil && h.bondedTunnel != nil {
 				h.OnConnected(h.bondedTunnel)
 			}

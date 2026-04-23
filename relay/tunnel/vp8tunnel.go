@@ -40,6 +40,7 @@ const (
 	vp8PayloadOverhead  = vp8PrefixMaxLen + 4 + 1 + vp8DataNonceSize + vp8DataTagSize
 	vp8PayloadSecret    = "whitelist-bypass-vp8-payload-v1"
 	vp8MinWriteSpacing  = time.Millisecond
+	vp8SendQueueSize    = 32
 )
 
 var (
@@ -78,6 +79,8 @@ type VP8DataTunnel struct {
 	nonceCtr      atomic.Uint64
 	nonceSalt     [4]byte
 	forceKeyframe atomic.Bool
+	paused        atomic.Bool
+	emergencyBusy atomic.Bool
 	lastWriteAt   time.Time
 }
 
@@ -93,6 +96,23 @@ func buildVP8TunnelNoopFrame(payloadSize int) []byte {
 }
 
 func (t *VP8DataTunnel) SendEmergencyKeyframe() {
+	if t.ctx.Err() != nil {
+		return
+	}
+	if !t.emergencyBusy.CompareAndSwap(false, true) {
+		return
+	}
+	t.paused.Store(true)
+	go func() {
+		defer t.emergencyBusy.Store(false)
+		time.Sleep(100 * time.Millisecond)
+		t.sendEmergencyKeyframeBurst()
+		time.Sleep(20 * time.Millisecond)
+		t.paused.Store(false)
+	}()
+}
+
+func (t *VP8DataTunnel) sendEmergencyKeyframeBurst() {
 	if t.ctx.Err() != nil {
 		return
 	}
@@ -137,7 +157,7 @@ func NewVP8DataTunnel(track *webrtc.TrackLocalStaticSample, logFn func(string, .
 	t := &VP8DataTunnel{
 		track:     track,
 		logFn:     logFn,
-		sendQueue: make(chan []byte, 256),
+		sendQueue: make(chan []byte, vp8SendQueueSize),
 		ctx:       ctx,
 		cancel:    cancel,
 	}
@@ -183,6 +203,9 @@ func (t *VP8DataTunnel) buildFrame(data []byte) []byte {
 }
 
 func (t *VP8DataTunnel) writeSampleDirect(data []byte, duration time.Duration) (uint64, []byte, error) {
+	if !t.waitWhilePaused() {
+		return 0, nil, nil
+	}
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
 	frame := t.buildFrame(data)
@@ -194,6 +217,18 @@ func (t *VP8DataTunnel) writeSampleDirect(data []byte, duration time.Duration) (
 	err := t.track.WriteSample(media.Sample{Data: frame, Duration: duration})
 	t.lastWriteAt = time.Now()
 	return frameID, frame, err
+}
+
+func (t *VP8DataTunnel) waitWhilePaused() bool {
+	for t.paused.Load() {
+		select {
+		case <-t.ctx.Done():
+			return false
+		default:
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+	return true
 }
 
 func (t *VP8DataTunnel) waitWriteSpacingLocked() {
