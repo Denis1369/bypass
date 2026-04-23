@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
@@ -372,6 +373,50 @@ func BuildVP8TunnelPool(tracks []*webrtc.TrackLocalStaticSample, logFn func(stri
 func StartVP8TunnelPool(lanes []*tunnel.VP8DataTunnel, fps int) {
 	for _, lane := range lanes {
 		lane.Start(fps)
+	}
+}
+
+func StartRTCPFeedbackReaders(pc *webrtc.PeerConnection, tracks []*webrtc.TrackLocalStaticSample, lanes []*tunnel.VP8DataTunnel, logFn func(string, ...any), prefix string) {
+	if pc == nil || len(tracks) == 0 || len(tracks) != len(lanes) {
+		return
+	}
+	laneByTrackID := make(map[string]*tunnel.VP8DataTunnel, len(tracks))
+	for i, track := range tracks {
+		if track == nil || lanes[i] == nil {
+			continue
+		}
+		laneByTrackID[track.ID()] = lanes[i]
+	}
+	for _, sender := range pc.GetSenders() {
+		if sender == nil || sender.Track() == nil || sender.Track().Kind() != webrtc.RTPCodecTypeVideo {
+			continue
+		}
+		trackID := sender.Track().ID()
+		lane := laneByTrackID[trackID]
+		if lane == nil {
+			continue
+		}
+		rtpSender := sender
+		go func(trackID string, lane *tunnel.VP8DataTunnel) {
+			for {
+				packets, _, err := rtpSender.ReadRTCP()
+				if err != nil {
+					if logFn != nil {
+						logFn("%s: RTCP reader closed for track=%s err=%v", prefix, trackID, err)
+					}
+					return
+				}
+				for _, packet := range packets {
+					switch packet.(type) {
+					case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
+						lane.ForceNextKeyframe()
+						if logFn != nil {
+							logFn("%s: RTCP keyframe request track=%s packet=%T", prefix, trackID, packet)
+						}
+					}
+				}
+			}
+		}(trackID, lane)
 	}
 }
 

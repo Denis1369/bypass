@@ -61,24 +61,26 @@ func vp8PayloadAEAD() (cipher.AEAD, error) {
 }
 
 type VP8DataTunnel struct {
-	track      *webrtc.TrackLocalStaticSample
-	mu         sync.Mutex
-	logFn      func(string, ...any)
-	frameCount uint64
-	running    bool
-	sendQueue  chan []byte
-	OnData     func([]byte)
-	OnClose    func()
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	stopOnce   sync.Once
-	nonceCtr   atomic.Uint64
-	nonceSalt  [4]byte
+	track         *webrtc.TrackLocalStaticSample
+	mu            sync.Mutex
+	logFn         func(string, ...any)
+	frameCount    uint64
+	running       bool
+	sendQueue     chan []byte
+	OnData        func([]byte)
+	OnClose       func()
+	ctx           context.Context
+	cancel        context.CancelFunc
+	wg            sync.WaitGroup
+	stopOnce      sync.Once
+	nonceCtr      atomic.Uint64
+	nonceSalt     [4]byte
+	forceKeyframe atomic.Bool
 }
 
 func (t *VP8DataTunnel) SetOnData(fn func([]byte)) { t.OnData = fn }
 func (t *VP8DataTunnel) SetOnClose(fn func())      { t.OnClose = fn }
+func (t *VP8DataTunnel) ForceNextKeyframe()        { t.forceKeyframe.Store(true) }
 
 func NewVP8DataTunnel(track *webrtc.TrackLocalStaticSample, logFn func(string, ...any)) *VP8DataTunnel {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -111,7 +113,7 @@ func (t *VP8DataTunnel) encryptPayload(data []byte) []byte {
 	nonce := t.nextNonce()
 	ciphertext := aead.Seal(nil, nonce, data, nil)
 	prefix := vp8InterframeMagic
-	if t.frameCount%60 == 0 {
+	if t.forceKeyframe.Swap(false) || t.frameCount%60 == 0 {
 		prefix = VP8KeyframeMagic
 	}
 	frame := make([]byte, len(prefix)+len(vp8TunnelSignature)+1+len(nonce)+len(ciphertext))

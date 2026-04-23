@@ -505,6 +505,7 @@ func (h *VKHeadlessJoiner) initPC() {
 	if mode == "video" {
 		h.sampleTracks = h.AddTracks(pc, h.logFn, "headless")
 		h.bondedTunnel, h.vp8tunnels, h.laneBinder = buildVP8TunnelPool(h.sampleTracks, h.logFn)
+		startRTCPFeedbackReaders(pc, h.sampleTracks, h.vp8tunnels, h.logFn, "headless")
 	}
 
 	negotiated := true
