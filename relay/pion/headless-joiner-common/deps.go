@@ -31,10 +31,11 @@ func applyFastICETimeouts(se *webrtc.SettingEngine) {
 	se.SetICETimeouts(2*time.Second, 4*time.Second, 500*time.Millisecond)
 }
 
-func startRTCPFeedbackReaders(pc *webrtc.PeerConnection, tracks []*webrtc.TrackLocalStaticSample, lanes []*tunnel.VP8DataTunnel, logFn func(string, ...any), prefix string) {
+func startRTCPFeedbackReaders(pc *webrtc.PeerConnection, tracks []*webrtc.TrackLocalStaticSample, lanes []*tunnel.VP8DataTunnel, congestion tunnel.DataTunnel, logFn func(string, ...any), prefix string) {
 	if pc == nil || len(tracks) == 0 || len(tracks) != len(lanes) {
 		return
 	}
+	resetter, _ := congestion.(tunnel.CongestionResetter)
 	laneByTrackID := make(map[string]*tunnel.VP8DataTunnel, len(tracks))
 	for i, track := range tracks {
 		if track == nil || lanes[i] == nil {
@@ -64,6 +65,9 @@ func startRTCPFeedbackReaders(pc *webrtc.PeerConnection, tracks []*webrtc.TrackL
 				for _, packet := range packets {
 					switch packet.(type) {
 					case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
+						if resetter != nil {
+							resetter.ResetCongestion()
+						}
 						lane.SendEmergencyKeyframe()
 						if logFn != nil {
 							logFn("%s: RTCP keyframe request track=%s packet=%T", prefix, trackID, packet)

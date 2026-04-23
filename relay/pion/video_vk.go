@@ -87,7 +87,7 @@ func (c *VKClient) createPC(config webrtc.Configuration) error {
 
 	c.sampleTracks = AddTunnelTracks(pc, c.logFn, "vk")
 	c.bondedTunnel, c.vp8tunnels, c.laneBinder = BuildVP8TunnelPool(c.sampleTracks, c.logFn)
-	StartRTCPFeedbackReaders(pc, c.sampleTracks, c.vp8tunnels, c.logFn, "vk")
+	StartRTCPFeedbackReaders(pc, c.sampleTracks, c.vp8tunnels, c.bondedTunnel, c.logFn, "vk")
 
 	// Create DataChannels required by VK SFU.
 	// The SFU sends producer-updated (SDP offer) via producerNotification DC.

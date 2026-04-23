@@ -151,7 +151,7 @@ func (c *TelemostClient) handleICEServers(data json.RawMessage, role string) {
 	if role == "pub" {
 		c.sampleTracks = AddTunnelTracks(pc, c.logFn, "telemost [pub]")
 		c.bondedTunnel, c.vp8tunnels, c.laneBinder = BuildVP8TunnelPool(c.sampleTracks, c.logFn)
-		StartRTCPFeedbackReaders(pc, c.sampleTracks, c.vp8tunnels, c.logFn, "telemost [pub]")
+		StartRTCPFeedbackReaders(pc, c.sampleTracks, c.vp8tunnels, c.bondedTunnel, c.logFn, "telemost [pub]")
 	}
 
 	pc.OnICECandidate(func(cand *webrtc.ICECandidate) {

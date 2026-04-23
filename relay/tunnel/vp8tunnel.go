@@ -105,7 +105,7 @@ func (t *VP8DataTunnel) SendEmergencyKeyframe() {
 	t.paused.Store(true)
 	go func() {
 		defer t.emergencyBusy.Store(false)
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 		t.sendEmergencyKeyframeBurst()
 		time.Sleep(20 * time.Millisecond)
 		t.paused.Store(false)
@@ -147,7 +147,7 @@ func (t *VP8DataTunnel) sendEmergencyKeyframeBurst() {
 			t.logFn("vp8tunnel: emergency keyframe sent attempt=%d frame=%d size=%d", attempt, frameID, len(frame))
 		}
 		if attempt < 3 {
-			time.Sleep(2 * time.Millisecond)
+			time.Sleep(5 * time.Millisecond)
 		}
 	}
 }

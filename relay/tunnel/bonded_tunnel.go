@@ -18,6 +18,8 @@ const (
 	bondedInitialChunkSize   = bondedMaxDataPayloadSize
 	bondedMaxChunkSize       = bondedMaxDataPayloadSize
 	bondedMinCwndBytes       = 128 * 1024
+	bondedCwndSlashBytes     = 16 * 1024
+	bondedCwndSlashDuration  = 700 * time.Millisecond
 	bondedInitialCwndBytes   = 256 * 1024
 	bondedMaxCwndBytes       = 8 * 1024 * 1024
 	bondedPriorityFrameSize  = 1200
@@ -109,62 +111,63 @@ func (s bondedBBRState) String() string {
 var bondedProbeBWGainCycle = [...]float64{1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0}
 
 type bondedLaneState struct {
-	metrics            bondedLaneMetrics
-	weight             float64
-	currentWeight      float64
-	score              float64
-	lossEWMA           float64
-	disorderEWMA       float64
-	smoothedRTT        time.Duration
-	lastRTT            time.Duration
-	pingOutstanding    bool
-	lastPingID         uint64
-	pingSentAt         time.Time
-	lastPong           time.Time
-	lastProbe          time.Time
-	failureStreak      int
-	probing            bool
-	lastObsOOO         uint64
-	lastObsLate        uint64
-	lastObsSkip        uint64
-	cwndBytes          int
-	inflightBytes      int
-	chunkSize          int
-	pacingRate         float64
-	lastAckAt          time.Time
-	nextSendAt         time.Time
-	pacingBudget       float64
-	lastPacingUpdate   time.Time
-	maxBandwidth       float64
-	maxBWSamples       []bondedBandwidthSample
-	ltBandwidth        float64
-	ltBWSamples        []bondedBandwidthSample
-	minRTTWindow       time.Duration
-	minRTTSamples      []bondedRTTSample
-	bbrState           bondedBBRState
-	pacingGain         float64
-	cwndGain           float64
-	fullBandwidth      float64
-	fullBwCount        int
-	probeBWIndex       int
-	probeBWStamp       time.Time
-	probeRTTUntil      time.Time
-	nextProbeRTTAt     time.Time
-	inflightHi         int
-	bwHi               float64
-	policerDetected    bool
-	safeRounds         int
-	roundCount         uint64
-	roundPending       bool
-	nextRoundDelivered uint64
-	roundAppLimited    bool
-	roundSentFrames    uint64
-	roundLossEvents    uint64
-	lastRoundLossRate  float64
-	lastSentFrameID    uint64
-	appLimited         bool
-	lastDataSentAt     time.Time
-	lastRxAt           time.Time
+	metrics              bondedLaneMetrics
+	weight               float64
+	currentWeight        float64
+	score                float64
+	lossEWMA             float64
+	disorderEWMA         float64
+	smoothedRTT          time.Duration
+	lastRTT              time.Duration
+	pingOutstanding      bool
+	lastPingID           uint64
+	pingSentAt           time.Time
+	lastPong             time.Time
+	lastProbe            time.Time
+	failureStreak        int
+	probing              bool
+	lastObsOOO           uint64
+	lastObsLate          uint64
+	lastObsSkip          uint64
+	cwndBytes            int
+	inflightBytes        int
+	chunkSize            int
+	pacingRate           float64
+	lastAckAt            time.Time
+	nextSendAt           time.Time
+	pacingBudget         float64
+	lastPacingUpdate     time.Time
+	maxBandwidth         float64
+	maxBWSamples         []bondedBandwidthSample
+	ltBandwidth          float64
+	ltBWSamples          []bondedBandwidthSample
+	minRTTWindow         time.Duration
+	minRTTSamples        []bondedRTTSample
+	bbrState             bondedBBRState
+	pacingGain           float64
+	cwndGain             float64
+	fullBandwidth        float64
+	fullBwCount          int
+	probeBWIndex         int
+	probeBWStamp         time.Time
+	probeRTTUntil        time.Time
+	nextProbeRTTAt       time.Time
+	congestionResetUntil time.Time
+	inflightHi           int
+	bwHi                 float64
+	policerDetected      bool
+	safeRounds           int
+	roundCount           uint64
+	roundPending         bool
+	nextRoundDelivered   uint64
+	roundAppLimited      bool
+	roundSentFrames      uint64
+	roundLossEvents      uint64
+	lastRoundLossRate    float64
+	lastSentFrameID      uint64
+	appLimited           bool
+	lastDataSentAt       time.Time
+	lastRxAt             time.Time
 }
 
 type bondedHistoryEntry struct {
@@ -484,6 +487,29 @@ func (t *BondedTunnel) GetTotalBufferUsage() int {
 		queued = 0
 	}
 	return inflight + coalesced + int(queued)
+}
+
+func (t *BondedTunnel) ResetCongestion() {
+	now := time.Now()
+	until := now.Add(bondedCwndSlashDuration)
+	t.sendMu.Lock()
+	for i := range t.laneStates {
+		state := &t.laneStates[i]
+		state.cwndBytes = bondedCwndSlashBytes
+		state.chunkSize = bondedMinChunkSize
+		state.pacingRate = bondedMinBwBytes
+		state.pacingBudget = 0
+		state.lastPacingUpdate = now
+		state.nextSendAt = until
+		state.bbrState = bondedBBRProbeRTT
+		state.probeRTTUntil = until
+		state.congestionResetUntil = until
+		if state.lossEWMA < 0.50 {
+			state.lossEWMA = 0.50
+		}
+	}
+	t.sendCond.Broadcast()
+	t.sendMu.Unlock()
 }
 
 func (t *BondedTunnel) ResetLane(index int) {
@@ -1425,10 +1451,15 @@ func (s *bondedLaneState) recomputeLaneBudgetLocked(now time.Time, holdChunk boo
 	if s.bbrState == bondedBBRProbeRTT {
 		targetCwnd = bondedMinCwndBytes
 	}
+	lowerCwnd := bondedMinCwndBytes
+	if now.Before(s.congestionResetUntil) {
+		targetCwnd = bondedCwndSlashBytes
+		lowerCwnd = bondedCwndSlashBytes
+	}
 	if limitByHi && s.inflightHi > 0 && targetCwnd > s.inflightHi {
 		targetCwnd = s.inflightHi
 	}
-	s.cwndBytes = clampInt(targetCwnd, bondedMinCwndBytes, bondedMaxCwndBytes)
+	s.cwndBytes = clampInt(targetCwnd, lowerCwnd, bondedMaxCwndBytes)
 
 	if holdChunk {
 		return
@@ -2323,6 +2354,7 @@ func (t *BondedTunnel) waitForPacing(lane int, frameSize int, _ bool) {
 				return
 			case <-timer.C:
 			}
+			continue
 		}
 		return
 	}
@@ -2528,6 +2560,7 @@ func (t *BondedTunnel) resetLaneLocked(index int, now time.Time) {
 	state.probeBWIndex = 0
 	state.probeBWStamp = now
 	state.probeRTTUntil = time.Time{}
+	state.congestionResetUntil = time.Time{}
 	state.nextProbeRTTAt = now.Add(10 * time.Second)
 	state.inflightHi = 0
 	state.bwHi = 0

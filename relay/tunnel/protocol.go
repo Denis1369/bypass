@@ -55,6 +55,10 @@ type BufferUsageReporter interface {
 	GetTotalBufferUsage() int
 }
 
+type CongestionResetter interface {
+	ResetCongestion()
+}
+
 func EncodeFrame(connID uint32, msgType byte, payload []byte) []byte {
 	buf := make([]byte, 4+5+len(payload))
 	binary.BigEndian.PutUint32(buf[0:4], uint32(5+len(payload)))

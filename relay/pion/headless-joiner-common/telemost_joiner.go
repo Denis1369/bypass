@@ -508,7 +508,7 @@ func (j *TelemostHeadlessJoiner) initPC() {
 
 	j.sampleTracks = j.AddTracks(pubPC, j.logFn, "telemost-joiner [pub]")
 	j.bondedTunnel, j.vp8tunnels, j.laneBinder = buildVP8TunnelPool(j.sampleTracks, j.logFn)
-	startRTCPFeedbackReaders(pubPC, j.sampleTracks, j.vp8tunnels, j.logFn, "telemost-joiner [pub]")
+	startRTCPFeedbackReaders(pubPC, j.sampleTracks, j.vp8tunnels, j.bondedTunnel, j.logFn, "telemost-joiner [pub]")
 
 	pubPC.OnICECandidate(func(cand *webrtc.ICECandidate) {
 		if cand != nil {
