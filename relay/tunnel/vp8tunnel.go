@@ -81,6 +81,7 @@ type VP8DataTunnel struct {
 	forceKeyframe atomic.Bool
 	paused        atomic.Bool
 	emergencyBusy atomic.Bool
+	recovering    atomic.Bool
 	lastWriteAt   time.Time
 }
 
@@ -95,6 +96,29 @@ func buildVP8TunnelNoopFrame(payloadSize int) []byte {
 	return EncodeFrame(BondedConnID, MsgNoop, make([]byte, payloadSize))
 }
 
+func (t *VP8DataTunnel) HandlePLI() {
+	if t.ctx.Err() != nil {
+		return
+	}
+	if !t.recovering.CompareAndSwap(false, true) {
+		return
+	}
+	t.paused.Store(true)
+	go func() {
+		defer t.recovering.Store(false)
+		if !t.sleepOrDone(400 * time.Millisecond) {
+			t.paused.Store(false)
+			return
+		}
+		t.SendEmergencyKeyframe()
+		if !t.sleepOrDone(50 * time.Millisecond) {
+			t.paused.Store(false)
+			return
+		}
+		t.paused.Store(false)
+	}()
+}
+
 func (t *VP8DataTunnel) SendEmergencyKeyframe() {
 	if t.ctx.Err() != nil {
 		return
@@ -102,14 +126,8 @@ func (t *VP8DataTunnel) SendEmergencyKeyframe() {
 	if !t.emergencyBusy.CompareAndSwap(false, true) {
 		return
 	}
-	t.paused.Store(true)
-	go func() {
-		defer t.emergencyBusy.Store(false)
-		time.Sleep(500 * time.Millisecond)
-		t.sendEmergencyKeyframeBurst()
-		time.Sleep(20 * time.Millisecond)
-		t.paused.Store(false)
-	}()
+	defer t.emergencyBusy.Store(false)
+	t.sendEmergencyKeyframeBurst()
 }
 
 func (t *VP8DataTunnel) sendEmergencyKeyframeBurst() {
@@ -149,6 +167,17 @@ func (t *VP8DataTunnel) sendEmergencyKeyframeBurst() {
 		if attempt < 3 {
 			time.Sleep(5 * time.Millisecond)
 		}
+	}
+}
+
+func (t *VP8DataTunnel) sleepOrDone(d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-t.ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 

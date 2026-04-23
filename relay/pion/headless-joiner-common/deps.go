@@ -68,7 +68,7 @@ func startRTCPFeedbackReaders(pc *webrtc.PeerConnection, tracks []*webrtc.TrackL
 						if resetter != nil {
 							resetter.ResetCongestion()
 						}
-						lane.SendEmergencyKeyframe()
+						lane.HandlePLI()
 						if logFn != nil {
 							logFn("%s: RTCP keyframe request track=%s packet=%T", prefix, trackID, packet)
 						}

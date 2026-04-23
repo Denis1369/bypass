@@ -19,7 +19,7 @@ const (
 	bondedMaxChunkSize       = bondedMaxDataPayloadSize
 	bondedMinCwndBytes       = 128 * 1024
 	bondedCwndSlashBytes     = 16 * 1024
-	bondedCwndSlashDuration  = 700 * time.Millisecond
+	bondedCwndSlashDuration  = 500 * time.Millisecond
 	bondedInitialCwndBytes   = 256 * 1024
 	bondedMaxCwndBytes       = 8 * 1024 * 1024
 	bondedPriorityFrameSize  = 1200
@@ -492,10 +492,16 @@ func (t *BondedTunnel) GetTotalBufferUsage() int {
 func (t *BondedTunnel) ResetCongestion() {
 	now := time.Now()
 	until := now.Add(bondedCwndSlashDuration)
+	purgedHistory := 0
+	drainedBytes := 0
 	t.sendMu.Lock()
+	purgedHistory = len(t.history)
+	t.history = make(map[uint64]*bondedHistoryEntry)
+	t.historyOrder = t.historyOrder[:0]
 	for i := range t.laneStates {
 		state := &t.laneStates[i]
 		state.cwndBytes = bondedCwndSlashBytes
+		state.inflightBytes = 0
 		state.chunkSize = bondedMinChunkSize
 		state.pacingRate = bondedMinBwBytes
 		state.pacingBudget = 0
@@ -507,9 +513,13 @@ func (t *BondedTunnel) ResetCongestion() {
 		if state.lossEWMA < 0.50 {
 			state.lossEWMA = 0.50
 		}
+		drainedBytes += t.drainDataQueueLocked(i)
 	}
 	t.sendCond.Broadcast()
 	t.sendMu.Unlock()
+	if (purgedHistory > 0 || drainedBytes > 0) && t.logFn != nil {
+		t.logFn("bonded: congestion reset purged history=%d queued_data=%dB cwnd=%d", purgedHistory, drainedBytes, bondedCwndSlashBytes)
+	}
 }
 
 func (t *BondedTunnel) ResetLane(index int) {
@@ -2073,6 +2083,7 @@ func (t *BondedTunnel) sendControlOnLane(lane int, msgType byte, payload []byte,
 }
 
 func (t *BondedTunnel) sendOps(ops []bondedSend) {
+nextOp:
 	for _, op := range ops {
 		if t.closed.Load() {
 			return
@@ -2091,6 +2102,10 @@ func (t *BondedTunnel) sendOps(ops []bondedSend) {
 			if op.lane < 0 || op.lane >= len(t.laneStates) {
 				t.sendMu.Unlock()
 				return
+			}
+			if _, found := t.history[op.frameID]; !found {
+				t.sendMu.Unlock()
+				continue nextOp
 			}
 			state := &t.laneStates[op.lane]
 			if state.inflightBytes+len(op.frame) <= state.cwndBytes {
@@ -2141,9 +2156,15 @@ func (t *BondedTunnel) pacerLoop(lane int) {
 				t.queuedBytes.Add(-int64(len(op.frame)))
 			}
 		}
+		if op.frameID != 0 && !t.hasHistoryFrame(op.frameID) {
+			continue
+		}
 		t.waitForPacing(lane, len(op.frame), false)
 		if t.closed.Load() {
 			return
+		}
+		if op.frameID != 0 && !t.hasHistoryFrame(op.frameID) {
+			continue
 		}
 		if !t.appendLaneCoalescer(lane, op) {
 			return
@@ -2260,6 +2281,13 @@ func (t *BondedTunnel) flushLaneCoalescer(lane int) bool {
 	}
 	t.lanes[lane].SendData(payload)
 	return !t.closed.Load()
+}
+
+func (t *BondedTunnel) hasHistoryFrame(frameID uint64) bool {
+	t.sendMu.Lock()
+	_, found := t.history[frameID]
+	t.sendMu.Unlock()
+	return found
 }
 
 func (t *BondedTunnel) coalescerFlushLoop(lane int) {
@@ -2483,19 +2511,28 @@ func (t *BondedTunnel) drainLaneQueuesLocked(index int) {
 	if index < 0 || index >= len(t.laneQueues) || index >= len(t.controlQueues) {
 		return
 	}
-	for {
-		select {
-		case <-t.laneQueues[index]:
-		default:
-			goto drainControl
-		}
+	t.drainDataQueueLocked(index)
+	t.drainBondedQueueLocked(t.controlQueues[index])
+}
+
+func (t *BondedTunnel) drainDataQueueLocked(index int) int {
+	if index < 0 || index >= len(t.laneQueues) {
+		return 0
 	}
-drainControl:
+	return t.drainBondedQueueLocked(t.laneQueues[index])
+}
+
+func (t *BondedTunnel) drainBondedQueueLocked(queue chan bondedSend) int {
+	drainedBytes := 0
 	for {
 		select {
-		case <-t.controlQueues[index]:
+		case op := <-queue:
+			drainedBytes += len(op.frame)
 		default:
-			return
+			if drainedBytes > 0 {
+				t.queuedBytes.Add(-int64(drainedBytes))
+			}
+			return drainedBytes
 		}
 	}
 }
