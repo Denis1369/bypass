@@ -24,7 +24,7 @@ const (
 	bondedInitialBwBytes     = 512 * 1024
 	bondedMinBwBytes         = 64 * 1024
 	bondedMaxBwBytes         = 32 * 1024 * 1024
-	bondedMaxLaneRateBytes   = 120 * 1024
+	bondedMaxLaneRateBytes   = 300 * 1024
 	bondedProbeGain          = 1.20
 	bondedProbePeriod        = 4 * time.Second
 	bondedProbeDuration      = 800 * time.Millisecond

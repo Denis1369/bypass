@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	relayBackpressureThreshold = 2 * 1024 * 1024
+	relayBackpressureThreshold = 128 * 1024
 	relayBackpressureSleep     = 10 * time.Millisecond
 )
 

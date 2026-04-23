@@ -39,6 +39,7 @@ const (
 	vp8PrefixMaxLen     = 17
 	vp8PayloadOverhead  = vp8PrefixMaxLen + 4 + 1 + vp8DataNonceSize + vp8DataTagSize
 	vp8PayloadSecret    = "whitelist-bypass-vp8-payload-v1"
+	vp8MinWriteSpacing  = time.Millisecond
 )
 
 var (
@@ -77,6 +78,7 @@ type VP8DataTunnel struct {
 	nonceCtr      atomic.Uint64
 	nonceSalt     [4]byte
 	forceKeyframe atomic.Bool
+	lastWriteAt   time.Time
 }
 
 func (t *VP8DataTunnel) SetOnData(fn func([]byte)) { t.OnData = fn }
@@ -111,7 +113,9 @@ func (t *VP8DataTunnel) SendEmergencyKeyframe() {
 			t.writeMu.Unlock()
 			return
 		}
+		t.waitWriteSpacingLocked()
 		err := t.track.WriteSample(media.Sample{Data: frame, Duration: 20 * time.Millisecond})
+		t.lastWriteAt = time.Now()
 		t.writeMu.Unlock()
 		if err != nil {
 			if t.logFn != nil {
@@ -186,8 +190,19 @@ func (t *VP8DataTunnel) writeSampleDirect(data []byte, duration time.Duration) (
 		return 0, nil, nil
 	}
 	frameID := t.frameCount - 1
+	t.waitWriteSpacingLocked()
 	err := t.track.WriteSample(media.Sample{Data: frame, Duration: duration})
+	t.lastWriteAt = time.Now()
 	return frameID, frame, err
+}
+
+func (t *VP8DataTunnel) waitWriteSpacingLocked() {
+	if t.lastWriteAt.IsZero() {
+		return
+	}
+	if delay := vp8MinWriteSpacing - time.Since(t.lastWriteAt); delay > 0 {
+		time.Sleep(delay)
+	}
 }
 
 var sendCount atomic.Uint64
